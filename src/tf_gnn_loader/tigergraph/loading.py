@@ -153,6 +153,30 @@ _LOADING_JOB_PATTERN = re.compile(
 )
 
 
+_GRAPH_DECLARATION_PATTERN = re.compile(
+    r"""
+    (?:USE|FOR)
+    \s+GRAPH\s+
+    (?P<graph_name>[A-Za-z_][A-Za-z0-9_]*)
+    """,
+    flags=(re.IGNORECASE | re.VERBOSE),
+)
+
+
+def _strip_gsql_comments(source: str) -> str:
+    """Remove /* */ and // comments so declarations are not read from prose.
+
+    Same idea as scripts/check_loader_contracts.py's strip_comments, and
+    for the same reason: these files carry long explanatory headers, and
+    any check that greps them as flat text will eventually fire on the
+    explanation rather than on the code.
+    """
+
+    without_block = re.sub(r"/\*.*?\*/", "", source, flags=re.S)
+
+    return re.sub(r"//.*", "", without_block)
+
+
 _FILENAME_PATTERN = re.compile(
     r"""
     DEFINE\s+FILENAME
@@ -312,18 +336,41 @@ def _read_loading_job_file_tags() -> dict[str, str]:
     if not source.strip():
         raise RuntimeError(f"GSQL file is empty: {path}")
 
-    # The superseded graph. TF_GNN declared Merchant_Category, City,
-    # State, Zipcode, Full_Name, Birthdate and the split attributes, none
-    # of which exist now, so a job left targeting it would install
-    # against a graph this loader can no longer produce data for.
-    if "TF_GNN" in source.replace("TransactionFraud_GNN", ""):
+    # CHECK THE DECLARATIONS, NOT THE PROSE.
+    #
+    # This used to be `if "TF_GNN" in source.replace("TransactionFraud_GNN",
+    # "")` --- a raw substring scan meant to catch a job left pointing at the
+    # superseded graph. It scanned COMMENTS too, so the header's own
+    # sentence explaining what "the previous TF_GNN jobs" did tripped it,
+    # and `load` refused a file that was completely correct. A guard that
+    # fires on an accurate comment about the thing it is guarding against
+    # is worse than no guard: the next person's fix is to delete the
+    # explanation.
+    #
+    # The real invariant is that every USE GRAPH / FOR GRAPH names the
+    # target, which is what admin.py has always checked --- hence
+    # install-jobs succeeding while this failed.
+    declarations = _GRAPH_DECLARATION_PATTERN.findall(_strip_gsql_comments(source))
+
+    if not declarations:
         raise RuntimeError(
-            "Superseded graph name TF_GNN found in "
-            + f"{path}; the target is TransactionFraud_GNN"
+            f"{path} declares no graph; it must contain " + f"'USE GRAPH {_GRAPHNAME}'"
         )
 
-    if "USE GRAPH TransactionFraud_GNN" not in source:
-        raise RuntimeError(f"{path} must contain 'USE GRAPH TransactionFraud_GNN'")
+    wrong = sorted({name for name in declarations if name != _GRAPHNAME})
+
+    if wrong:
+        raise RuntimeError(
+            f"{path} targets "
+            + ", ".join(wrong)
+            + f"; the target is {_GRAPHNAME}. A job pointing at the "
+            + "superseded TF_GNN graph would reference vertex types "
+            + "(Merchant_Category, City, State, Zipcode, Full_Name, "
+            + "Birthdate) and split attributes that no longer exist."
+        )
+
+    if f"USE GRAPH {_GRAPHNAME}" not in _strip_gsql_comments(source):
+        raise RuntimeError(f"{path} must contain 'USE GRAPH {_GRAPHNAME}'")
 
     result: dict[str, str] = {}
 

@@ -38,6 +38,13 @@ message that does not name the file that caused it:
   11. No forbidden attributes   The schema declares no split, protected or
                                 response-time attribute, so no loading job
                                 may name one.
+  13. Graph declarations        Every USE GRAPH / FOR GRAPH in the GSQL
+                                names the target graph. Checked on
+                                COMMENT-STRIPPED text: the previous
+                                version of this guard lived in loading.py,
+                                grepped raw source for "TF_GNN", and fired
+                                on the header comment explaining what the
+                                old TF_GNN jobs did.
   12. Manifest format version   export.py WRITES the version that
                                 loading.py READS. They live in different
                                 modules, and they drifted once already:
@@ -67,6 +74,8 @@ TG_VERIFY_PY = ROOT / "src" / "tf_gnn_loader" / "tigergraph" / "verify.py"
 TG_LOADING_PY = ROOT / "src" / "tf_gnn_loader" / "tigergraph" / "loading.py"
 PG_VERIFY_PY = ROOT / "src" / "tf_gnn_loader" / "postgres" / "verify.py"
 SQL_DIR = ROOT / "sql" / "postgres"
+
+TARGET_GRAPH = "TransactionFraud_GNN"
 
 # PostgreSQL functions live in tf_gnn_prep too, so a FROM/JOIN check has to
 # know they are not relations.
@@ -427,6 +436,18 @@ def main() -> int:
             f"loading.py expects {expected.group(1)}; `load` would reject "
             "the manifest `export` produces",
         )
+
+    # ---- 13. graph declarations name the target ----
+    print("13. every USE GRAPH / FOR GRAPH names TransactionFraud_GNN")
+
+    for label, text in (("loading_jobs.gsql", jobs), ("verify_load.gsql", verify)):
+        declared = set(re.findall(r"(?:USE|FOR)\s+GRAPH\s+(\w+)", text, re.IGNORECASE))
+
+        if not declared:
+            fail("graph-name", f"{label} declares no graph at all")
+
+        for name in sorted(declared - {TARGET_GRAPH}):
+            fail("graph-name", f"{label} targets {name!r}, not {TARGET_GRAPH!r}")
 
     print()
 
