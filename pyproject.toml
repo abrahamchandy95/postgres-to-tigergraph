@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tf-gnn-loader"
+version = "0.3.0"
+description = "Prepare PhantomLedger PostgreSQL data and load it into TigerGraph TransactionFraud_GNN"
+requires-python = ">=3.11"
+dependencies = [
+  "psycopg[binary]>=3.2,<4",
+  "pydantic>=2.10,<3",
+  "pydantic-settings>=2.7,<3",
+  "pyTigerGraph>=1.8,<2",
+]
+
+[project.scripts]
+tf-gnn-load = "tf_gnn_loader.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

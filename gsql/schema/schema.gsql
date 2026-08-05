@@ -1,0 +1,383 @@
+/*
+===============================================================================
+TransactionFraud_GNN schema v1
+Target: TigerGraph 4.2.x
+===============================================================================
+
+Purpose
+-------
+Predict fraud for one payment transaction with a combined temporal GNN (TGN)
+and heterogeneous relational GNN (R-GCN). Payment_Transaction is the supervised
+event vertex. Its typed relations preserve the initiating/funding account, card, merchant,
+location, device and IP roles needed by R-GCN message passing. event_seq is the
+canonical clock used by TGN and every cutoff-safe query.
+
+This is a fresh-graph DDL. It deliberately contains no loading job and no fixed
+population or transaction count. The expected load covers three years and about
+150,000 individuals, but those are measured data properties, never schema
+constants.
+
+Temporal contract
+-----------------
+* event_seq is unique, deterministic, dense from 1 through the transaction
+  count, strictly positive, and ordered by (event_ts_ms, transaction_id).
+* DATETIME is retained for operator readability. event_ts_ms is authoritative
+  because DATETIME does not preserve sub-second ordering.
+* Every transaction-participation edge repeats event_seq and event_ts_ms.
+* Slowly changing edges are visible to seed s only when
+    valid_from_seq <= s.event_seq
+    AND (valid_to_seq == 0 OR s.event_seq < valid_to_seq).
+  Static ownership/PII facts known at the authorization request may therefore
+  be visible on the seed event itself. Historical transaction context always
+  uses neighbor.event_seq < seed.event_seq.
+* fraud_label and label_* are supervision metadata. No model feature/message
+  query may read them.
+
+Privacy and feature contract
+----------------------------
+Email, phone, address, identity-document, device and IP primary IDs must be
+salted/tokenized before loading. Raw PII is not stored. IDs are join keys, never
+numeric features. Protected attributes such as name, gender and ethnicity are
+intentionally absent. No corpus-wide count, fraud rate, risk score derived from
+future labels, embedding, or model output is persisted on an entity vertex.
+Shared PII topology is sufficient for v1; entity-resolution, match, and unify
+vertices or edges are intentionally outside this schema and may be added later
+as an optional, separately versioned module.
+
+All non-key attributes on persistent entity vertices are immutable
+first-observation snapshots: their values must have been known no later than
+the vertex's first_seen_seq/first_seen_ts_ms and must never be overwritten with
+later state. A mutable observation (for example a later device OS, IP network,
+merchant classification, or country) belongs on the contemporaneous
+Payment_Transaction or in a separately versioned fact, not in-place here. This
+is what makes full node-table export safe for historical sampling.
+
+Cardinality contract (validated by tfgnn_validate_graph)
+---------------------------------------------------------
+Each Payment_Transaction has exactly one initiating/funding Account and one
+Merchant acceptance endpoint, and at most one Card, Merchant_Location, canonical
+Device and canonical source IP_Address. The Merchant is the receiving side; its
+settlement account is not modeled as a second Account in v1.
+Optional endpoints may be absent. A Device or IP_Address may be shared by many
+transactions; bounded temporal sampling prevents those hubs from expanding an
+R-GCN batch without limit. At the graph high-water mark, each Merchant has
+exactly one cutoff-visible operating Party; historical non-overlapping operator
+tenures may coexist. Each Account has at least one cutoff-visible owning Party;
+multiple owners are allowed for joint accounts.
+This scope is merchant-payment authorizations. True account-to-account transfers
+or a single record funded by multiple accounts require role-specific relations in
+a later schema version rather than overloading Transaction_From_Account.
+===============================================================================
+*/
+
+CREATE GRAPH TransactionFraud_GNN()
+
+USE GRAPH TransactionFraud_GNN
+
+CREATE SCHEMA_CHANGE JOB transaction_fraud_gnn_schema_v1
+FOR GRAPH TransactionFraud_GNN {
+
+  /* -------------------------------------------------------------------------
+     Persistent customer and payment entities
+     ------------------------------------------------------------------------- */
+
+  /* party_type vocabulary: individual, company, merchant_entity; unknown is
+     permitted only when the source has not classified the party. */
+  ADD VERTEX Party(
+      PRIMARY_ID party_id STRING,
+      first_seen_seq UINT,
+      first_seen_ts_ms UINT,
+      customer_since_ts_ms UINT DEFAULT 0,
+      party_type STRING DEFAULT "unknown",
+      home_country STRING DEFAULT ""
+  ) WITH PRIMARY_ID_AS_ATTRIBUTE="true", STATS="OUTDEGREE_BY_EDGETYPE";
+
+  ADD VERTEX Account(
+      PRIMARY_ID account_id STRING,
+      first_seen_seq UINT,
+      first_seen_ts_ms UINT,
+      opened_ts_ms UINT DEFAULT 0,
+      account_type STRING DEFAULT "unknown",
+      base_currency STRING DEFAULT "",
+      country_code STRING DEFAULT ""
+  ) WITH PRIMARY_ID_AS_ATTRIBUTE="true", STATS="OUTDEGREE_BY_EDGETYPE";
+
+  ADD VERTEX Card(
+      PRIMARY_ID card_id STRING,
+      first_seen_seq UINT,
+      first_seen_ts_ms UINT,
+      issued_ts_ms UINT DEFAULT 0,
+      card_type STRING DEFAULT "unknown",
+      card_network STRING DEFAULT "unknown",
+      card_product STRING DEFAULT "unknown",
+      is_virtual BOOL DEFAULT "false"
+  ) WITH PRIMARY_ID_AS_ATTRIBUTE="true", STATS="OUTDEGREE_BY_EDGETYPE";
+
+  ADD VERTEX Merchant(
+      PRIMARY_ID merchant_id STRING,
+      first_seen_seq UINT,
+      first_seen_ts_ms UINT,
+      onboarded_ts_ms UINT DEFAULT 0,
+      merchant_category_code STRING DEFAULT "",
+      merchant_country STRING DEFAULT "",
+      merchant_type STRING DEFAULT "unknown",
+      is_online BOOL DEFAULT "false"
+  ) WITH PRIMARY_ID_AS_ATTRIBUTE="true", STATS="OUTDEGREE_BY_EDGETYPE";
+
+  ADD VERTEX Merchant_Location(
+      PRIMARY_ID location_id STRING,
+      first_seen_seq UINT,
+      first_seen_ts_ms UINT,
+      country_code STRING DEFAULT "",
+      region_code STRING DEFAULT "",
+      postal_code_prefix STRING DEFAULT "",
+      latitude DOUBLE DEFAULT 0,
+      longitude DOUBLE DEFAULT 0,
+      has_coordinates BOOL DEFAULT "false"
+  ) WITH PRIMARY_ID_AS_ATTRIBUTE="true", STATS="OUTDEGREE_BY_EDGETYPE";
+
+  /* -------------------------------------------------------------------------
+     Infrastructure entities. They are nodes because reuse is graph signal.
+     Mutable reputation/vendor scores belong on Payment_Transaction as an
+     event-time snapshot, not here as a current-state value.
+     ------------------------------------------------------------------------- */
+
+  ADD VERTEX Device(
+      PRIMARY_ID device_id STRING,
+      first_seen_seq UINT,
+      first_seen_ts_ms UINT,
+      device_type STRING DEFAULT "unknown",
+      os_family STRING DEFAULT "unknown",
+      browser_family STRING DEFAULT "unknown"
+  ) WITH PRIMARY_ID_AS_ATTRIBUTE="true", STATS="OUTDEGREE_BY_EDGETYPE";
+
+  ADD VERTEX IP_Address(
+      PRIMARY_ID ip_id STRING,
+      first_seen_seq UINT,
+      first_seen_ts_ms UINT,
+      country_code STRING DEFAULT "",
+      asn INT DEFAULT -1,
+      network_type STRING DEFAULT "unknown"
+  ) WITH PRIMARY_ID_AS_ATTRIBUTE="true", STATS="OUTDEGREE_BY_EDGETYPE";
+
+  /* -------------------------------------------------------------------------
+     Tokenized PII value nodes. Shared values create traversable topology.
+     ------------------------------------------------------------------------- */
+
+  ADD VERTEX Email(
+      PRIMARY_ID email_id STRING,
+      first_seen_seq UINT,
+      first_seen_ts_ms UINT,
+      domain STRING DEFAULT ""
+  ) WITH PRIMARY_ID_AS_ATTRIBUTE="true", STATS="OUTDEGREE_BY_EDGETYPE";
+
+  ADD VERTEX Phone(
+      PRIMARY_ID phone_id STRING,
+      first_seen_seq UINT,
+      first_seen_ts_ms UINT,
+      country_code STRING DEFAULT "",
+      line_type STRING DEFAULT "unknown"
+  ) WITH PRIMARY_ID_AS_ATTRIBUTE="true", STATS="OUTDEGREE_BY_EDGETYPE";
+
+  ADD VERTEX Address(
+      PRIMARY_ID address_id STRING,
+      first_seen_seq UINT,
+      first_seen_ts_ms UINT,
+      country_code STRING DEFAULT "",
+      region_code STRING DEFAULT "",
+      postal_code_prefix STRING DEFAULT ""
+  ) WITH PRIMARY_ID_AS_ATTRIBUTE="true", STATS="OUTDEGREE_BY_EDGETYPE";
+
+  ADD VERTEX Identity_Document(
+      PRIMARY_ID document_id STRING,
+      first_seen_seq UINT,
+      first_seen_ts_ms UINT,
+      document_type STRING DEFAULT "unknown",
+      issuing_country STRING DEFAULT ""
+  ) WITH PRIMARY_ID_AS_ATTRIBUTE="true", STATS="OUTDEGREE_BY_EDGETYPE";
+
+  /* -------------------------------------------------------------------------
+     Label-bearing event vertex.
+
+     amount_present separates a genuine zero from an unloaded/default amount.
+     Optional event-time risk scores use -1 as an explicit unavailable sentinel.
+     Current authorization response/status is intentionally absent: the scoring
+     moment is the authorization request, before that response exists.
+     ------------------------------------------------------------------------- */
+
+  ADD VERTEX Payment_Transaction(
+      PRIMARY_ID transaction_id STRING,
+
+      event_time DATETIME,
+      event_ts_ms UINT,
+      event_seq UINT,
+
+      amount DOUBLE DEFAULT 0,
+      amount_present BOOL DEFAULT "false",
+      currency STRING DEFAULT "",
+      transaction_type STRING DEFAULT "unknown",
+      channel STRING DEFAULT "unknown",
+      entry_mode STRING DEFAULT "unknown",
+      card_present BOOL DEFAULT "false",
+      is_cross_border BOOL DEFAULT "false",
+      is_recurring BOOL DEFAULT "false",
+      merchant_category_code STRING DEFAULT "",
+
+      has_event_location BOOL DEFAULT "false",
+      event_latitude DOUBLE DEFAULT 0,
+      event_longitude DOUBLE DEFAULT 0,
+
+      device_risk_score DOUBLE DEFAULT -1,
+      ip_risk_score DOUBLE DEFAULT -1,
+
+      fraud_label INT DEFAULT -1,
+      label_known BOOL DEFAULT "false",
+      label_available_seq UINT DEFAULT 0,
+      label_available_ts_ms UINT DEFAULT 0,
+      label_source STRING DEFAULT ""
+  ) WITH PRIMARY_ID_AS_ATTRIBUTE="true", STATS="OUTDEGREE_BY_EDGETYPE";
+
+  /* -------------------------------------------------------------------------
+     Slowly changing ownership and tokenized-PII relations.
+
+     valid_to_seq == 0 means no known end. There is intentionally no
+     DISCRIMINATOR: the v1 contract represents one consolidated association per
+     endpoint pair. If discontinuous tenures become a real source-data concept,
+     they require a schema migration and a discriminator rather than silent
+     overwrites.
+     ------------------------------------------------------------------------- */
+
+  ADD DIRECTED EDGE Party_Owns_Account(
+      FROM Party, TO Account,
+      valid_from_seq UINT,
+      valid_to_seq UINT DEFAULT 0,
+      confidence FLOAT DEFAULT 1.0,
+      source_system STRING DEFAULT ""
+  ) WITH REVERSE_EDGE="Account_Owned_By_Party";
+
+  ADD DIRECTED EDGE Account_Has_Card(
+      FROM Account, TO Card,
+      valid_from_seq UINT,
+      valid_to_seq UINT DEFAULT 0,
+      confidence FLOAT DEFAULT 1.0,
+      source_system STRING DEFAULT ""
+  ) WITH REVERSE_EDGE="Card_Belongs_To_Account";
+
+  ADD DIRECTED EDGE Party_Has_Email(
+      FROM Party, TO Email,
+      valid_from_seq UINT,
+      valid_to_seq UINT DEFAULT 0,
+      confidence FLOAT DEFAULT 1.0,
+      source_system STRING DEFAULT ""
+  ) WITH REVERSE_EDGE="Email_Belongs_To_Party";
+
+  ADD DIRECTED EDGE Party_Has_Phone(
+      FROM Party, TO Phone,
+      valid_from_seq UINT,
+      valid_to_seq UINT DEFAULT 0,
+      confidence FLOAT DEFAULT 1.0,
+      source_system STRING DEFAULT ""
+  ) WITH REVERSE_EDGE="Phone_Belongs_To_Party";
+
+  ADD DIRECTED EDGE Party_Has_Address(
+      FROM Party, TO Address,
+      valid_from_seq UINT,
+      valid_to_seq UINT DEFAULT 0,
+      confidence FLOAT DEFAULT 1.0,
+      source_system STRING DEFAULT ""
+  ) WITH REVERSE_EDGE="Address_Belongs_To_Party";
+
+  ADD DIRECTED EDGE Party_Has_Identity_Document(
+      FROM Party, TO Identity_Document,
+      valid_from_seq UINT,
+      valid_to_seq UINT DEFAULT 0,
+      confidence FLOAT DEFAULT 1.0,
+      source_system STRING DEFAULT ""
+  ) WITH REVERSE_EDGE="Identity_Document_Belongs_To_Party";
+
+  ADD DIRECTED EDGE Party_Has_Device(
+      FROM Party, TO Device,
+      valid_from_seq UINT,
+      valid_to_seq UINT DEFAULT 0,
+      confidence FLOAT DEFAULT 1.0,
+      source_system STRING DEFAULT ""
+  ) WITH REVERSE_EDGE="Device_Associated_With_Party";
+
+  ADD DIRECTED EDGE Party_Has_IP(
+      FROM Party, TO IP_Address,
+      valid_from_seq UINT,
+      valid_to_seq UINT DEFAULT 0,
+      confidence FLOAT DEFAULT 1.0,
+      source_system STRING DEFAULT ""
+  ) WITH REVERSE_EDGE="IP_Associated_With_Party";
+
+  ADD DIRECTED EDGE Party_Operates_Merchant(
+      FROM Party, TO Merchant,
+      valid_from_seq UINT,
+      valid_to_seq UINT DEFAULT 0,
+      confidence FLOAT DEFAULT 1.0,
+      source_system STRING DEFAULT ""
+  ) WITH REVERSE_EDGE="Merchant_Operated_By_Party";
+
+  ADD DIRECTED EDGE Merchant_Has_Location(
+      FROM Merchant, TO Merchant_Location,
+      valid_from_seq UINT,
+      valid_to_seq UINT DEFAULT 0,
+      confidence FLOAT DEFAULT 1.0,
+      source_system STRING DEFAULT ""
+  ) WITH REVERSE_EDGE="Location_Belongs_To_Merchant";
+
+  /* -------------------------------------------------------------------------
+     Per-transaction participation relations. These are canonical R-GCN edge
+     types and the export surface used to build cuGraph heterogeneous stores.
+     ------------------------------------------------------------------------- */
+
+  ADD DIRECTED EDGE Transaction_From_Account(
+      FROM Payment_Transaction, TO Account,
+      event_ts_ms UINT,
+      event_seq UINT
+  ) WITH REVERSE_EDGE="Account_Initiated_Transaction";
+
+  ADD DIRECTED EDGE Transaction_Used_Card(
+      FROM Payment_Transaction, TO Card,
+      event_ts_ms UINT,
+      event_seq UINT
+  ) WITH REVERSE_EDGE="Card_Used_By_Transaction";
+
+  ADD DIRECTED EDGE Transaction_At_Merchant(
+      FROM Payment_Transaction, TO Merchant,
+      event_ts_ms UINT,
+      event_seq UINT
+  ) WITH REVERSE_EDGE="Merchant_Received_Transaction";
+
+  ADD DIRECTED EDGE Transaction_At_Location(
+      FROM Payment_Transaction, TO Merchant_Location,
+      event_ts_ms UINT,
+      event_seq UINT
+  ) WITH REVERSE_EDGE="Location_Observed_In_Transaction";
+
+  ADD DIRECTED EDGE Transaction_Used_Device(
+      FROM Payment_Transaction, TO Device,
+      event_ts_ms UINT,
+      event_seq UINT
+  ) WITH REVERSE_EDGE="Device_Used_By_Transaction";
+
+  ADD DIRECTED EDGE Transaction_From_IP(
+      FROM Payment_Transaction, TO IP_Address,
+      event_ts_ms UINT,
+      event_seq UINT
+  ) WITH REVERSE_EDGE="IP_Observed_In_Transaction";
+}
+
+RUN SCHEMA_CHANGE JOB transaction_fraud_gnn_schema_v1
+
+/*
+Expected queryable catalog after the job:
+  12 vertex types
+  16 forward edge types
+  16 explicit reverse edge types
+
+No loading job is part of this repository contract. After the independently
+managed load completes, create/install the queries under gsql/queries and run
+tfgnn_validate_graph before exporting or training.
+*/

@@ -1,0 +1,61 @@
+# ---------------------------------------------------------------------
+# Secrets
+#
+# .env holds the TigerGraph REST++ SECRET and TFGNN_PII_SALT. The salt is
+# the one that bites twice: it is not just a credential, it is the key the
+# Device / IP_Address / Email / Phone / Address / Identity_Document primary
+# ids are derived from, so leaking it makes every tokenised id in the
+# graph reversible by dictionary search.
+# ---------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+
+# ---------------------------------------------------------------------
+# Agent and tool configuration
+# ---------------------------------------------------------------------
+.claude/
+.codex/
+CLAUDE.md
+AGENTS.md
+
+# ---------------------------------------------------------------------
+# Generated knowledge graph. Rebuilt from source by `graphify update .`,
+# and it keeps dated snapshot directories, so tracking it turns every
+# code change into a large unrelated diff.
+# ---------------------------------------------------------------------
+graphify-out/
+
+# ---------------------------------------------------------------------
+# Runtime load artifacts: PSV shards, export manifest, verification
+# reports, pipeline logs. Runtime-specific and large --- the transaction
+# dataset alone runs to several GB at corpus scale.
+#
+# EXPORT_DIR is configurable, so the bare *.psv rule is the backstop for
+# an export written outside artifacts/.
+# ---------------------------------------------------------------------
+artifacts/
+*.psv
+*.log
+
+# ---------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+
+# ---------------------------------------------------------------------
+# Editor and OS
+# ---------------------------------------------------------------------
+.DS_Store
+.idea/
+.vscode/
+*.swp

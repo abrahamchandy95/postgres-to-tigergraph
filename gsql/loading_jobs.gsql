@@ -1,0 +1,554 @@
+/*
+======================================================================
+TransactionFraud_GNN LOADING JOBS
+======================================================================
+
+One job per exported dataset, 24 of them. Column positions ($0, $1, ...)
+map one-to-one onto the PSV columns produced by the matching
+tf_gnn_prep.load_* view; sql/postgres/080_create_load_views.sql is the
+other half of this contract. Change either side and you change both, and
+scripts/check_loader_contracts.py compares them mechanically.
+
+ATTRIBUTE ORDER INSIDE EACH `VALUES` IS THE SCHEMA'S ORDER, not the
+PSV's. They agree everywhere except job 22, which appends four endpoint
+keys the vertex does not carry. TigerGraph rejects a VALUES list of the
+wrong ARITY outright, but a reordering WITHIN a run of same-typed
+attributes is accepted silently and writes to the wrong column --- so
+regenerate a list from gsql/schema/schema.gsql rather than editing one by
+hand.
+
+----------------------------------------------------------------------
+DECISIONS ENCODED HERE, so nobody re-litigates them per job
+----------------------------------------------------------------------
+
+ONE PSV ROW CREATES FIVE OBJECTS (job 22). The Payment_Transaction
+vertex and its Account, Card, Merchant and Location edges all come off
+the same line. That is what makes the schema's cardinality contract ---
+"exactly one Account and Merchant, at most one Card and Location" --- true
+BY CONSTRUCTION rather than by assertion, and it avoids four more copies
+of a 27M-row file. Every participation edge takes event_ts_ms and
+event_seq from the same line's $2 and $3, which is the premise
+tfgnn_validate_graph's edge-stamp check exists to prove.
+
+Transaction_At_Location IS GUARDED. An online merchant has no outlet, so
+$27 is empty on those rows. Without the WHERE, TigerGraph would create an
+edge to a Merchant_Location whose primary id is the empty string --- a
+real vertex, silently, on every card-not-present authorization.
+
+DEVICE AND IP ARE SEPARATE JOBS (23, 24), not more columns on 22. They
+are OPTIONAL endpoints with their own row counts: a transaction with no
+recorded device produces no row at all. Folding them in would need the
+same empty-value guard for a genuinely sparse relation, and would break
+the equality between 22's row count and its edge counts that the verifier
+relies on.
+
+NO ATTRIBUTE IS A PLACEHOLDER. The previous TF_GNN jobs were mostly `_`
+markers for build output --- pagerank, community ids, neighbourhood
+aggregates --- that the loader was not allowed to supply. The new schema
+declares none of that: "no corpus-wide count, fraud rate, risk score
+derived from future labels, embedding, or model output is persisted on an
+entity vertex". Every position below carries a real loaded value, and if
+a future edit needs a `_` here it is a sign the schema grew a computed
+attribute it should not have.
+
+LOAD ORDER IS NOT EXPRESSED IN THIS FILE. It is the dataset numbering in
+src/tf_gnn_loader/postgres/export.py, which tigergraph/loading.py walks in
+sorted order: all 11 vertex types, then the 10 slowly changing relations,
+then the fact table, then the two event-time endpoints. TigerGraph upserts
+an unseen endpoint with schema defaults rather than failing, and a vertex
+created that way carries first_seen_seq = 0, which passes every
+first_seen_seq <= cutoff filter including cutoffs from before the entity
+existed. Running these jobs by hand in a different order reintroduces
+exactly that.
+
+WHAT NO JOB LOADS, because the schema declares nowhere to put it:
+    split_id, causal_fold        separation is a cutoff on event_seq
+    error                        an authorization RESPONSE; the scoring
+                                 moment is the request
+    name, gender, dob            protected attributes
+    is_blocked                   a timeless blocklist flag is a function
+                                 of the label
+    raw email / phone / address  tokenised in PostgreSQL before export
+======================================================================
+*/
+
+USE GRAPH TransactionFraud_GNN
+
+
+/*
+======================================================================
+01-11  VERTICES
+======================================================================
+first_seen_seq is never 0. sql/postgres/030_create_event_sequence.sql
+guarantees it and tf_gnn_prep.audit_first_seen gates it, because a zero
+stamp makes an entity visible to cutoffs from before it existed.
+======================================================================
+*/
+
+CREATE LOADING JOB tfgnn_load_parties FOR GRAPH TransactionFraud_GNN {
+  DEFINE FILENAME f;
+
+  LOAD f
+    TO VERTEX Party VALUES (
+      $0,  // party_id
+      $1,  // first_seen_seq
+      $2,  // first_seen_ts_ms
+      $3,  // customer_since_ts_ms
+      $4,  // party_type
+      $5   // home_country
+    )
+    USING SEPARATOR="|";
+}
+
+
+CREATE LOADING JOB tfgnn_load_accounts FOR GRAPH TransactionFraud_GNN {
+  DEFINE FILENAME f;
+
+  LOAD f
+    TO VERTEX Account VALUES (
+      $0,  // account_id
+      $1,  // first_seen_seq
+      $2,  // first_seen_ts_ms
+      $3,  // opened_ts_ms
+      $4,  // account_type
+      $5,  // base_currency
+      $6   // country_code
+    )
+    USING SEPARATOR="|";
+}
+
+
+CREATE LOADING JOB tfgnn_load_cards FOR GRAPH TransactionFraud_GNN {
+  DEFINE FILENAME f;
+
+  LOAD f
+    TO VERTEX Card VALUES (
+      $0,  // card_id
+      $1,  // first_seen_seq
+      $2,  // first_seen_ts_ms
+      $3,  // issued_ts_ms
+      $4,  // card_type
+      $5,  // card_network
+      $6,  // card_product
+      $7   // is_virtual
+    )
+    USING SEPARATOR="|";
+}
+
+
+CREATE LOADING JOB tfgnn_load_merchants FOR GRAPH TransactionFraud_GNN {
+  DEFINE FILENAME f;
+
+  LOAD f
+    TO VERTEX Merchant VALUES (
+      $0,  // merchant_id
+      $1,  // first_seen_seq
+      $2,  // first_seen_ts_ms
+      $3,  // onboarded_ts_ms
+      $4,  // merchant_category_code
+      $5,  // merchant_country
+      $6,  // merchant_type
+      $7   // is_online
+    )
+    USING SEPARATOR="|";
+}
+
+
+CREATE LOADING JOB tfgnn_load_merchant_locations FOR GRAPH TransactionFraud_GNN {
+  DEFINE FILENAME f;
+
+  // has_coordinates is the mask and the coordinates are already zeroed
+  // when it is false. Never test latitude <> 0 downstream: the prime
+  // meridian and the equator are both real, and 0,0 is a place in the
+  // Gulf of Guinea.
+  LOAD f
+    TO VERTEX Merchant_Location VALUES (
+      $0,  // location_id
+      $1,  // first_seen_seq
+      $2,  // first_seen_ts_ms
+      $3,  // country_code
+      $4,  // region_code
+      $5,  // postal_code_prefix
+      $6,  // latitude
+      $7,  // longitude
+      $8   // has_coordinates
+    )
+    USING SEPARATOR="|";
+}
+
+
+CREATE LOADING JOB tfgnn_load_devices FOR GRAPH TransactionFraud_GNN {
+  DEFINE FILENAME f;
+
+  // device_id is an HMAC-SHA256 token, not a device fingerprint.
+  LOAD f
+    TO VERTEX Device VALUES (
+      $0,  // device_id
+      $1,  // first_seen_seq
+      $2,  // first_seen_ts_ms
+      $3,  // device_type
+      $4,  // os_family
+      $5   // browser_family
+    )
+    USING SEPARATOR="|";
+}
+
+
+CREATE LOADING JOB tfgnn_load_ip_addresses FOR GRAPH TransactionFraud_GNN {
+  DEFINE FILENAME f;
+
+  LOAD f
+    TO VERTEX IP_Address VALUES (
+      $0,  // ip_id
+      $1,  // first_seen_seq
+      $2,  // first_seen_ts_ms
+      $3,  // country_code
+      $4,  // asn
+      $5   // network_type
+    )
+    USING SEPARATOR="|";
+}
+
+
+CREATE LOADING JOB tfgnn_load_emails FOR GRAPH TransactionFraud_GNN {
+  DEFINE FILENAME f;
+
+  // domain is the mail provider and is not personal; the local part
+  // never left PostgreSQL.
+  LOAD f
+    TO VERTEX Email VALUES (
+      $0,  // email_id
+      $1,  // first_seen_seq
+      $2,  // first_seen_ts_ms
+      $3   // domain
+    )
+    USING SEPARATOR="|";
+}
+
+
+CREATE LOADING JOB tfgnn_load_phones FOR GRAPH TransactionFraud_GNN {
+  DEFINE FILENAME f;
+
+  LOAD f
+    TO VERTEX Phone VALUES (
+      $0,  // phone_id
+      $1,  // first_seen_seq
+      $2,  // first_seen_ts_ms
+      $3,  // country_code
+      $4   // line_type
+    )
+    USING SEPARATOR="|";
+}
+
+
+CREATE LOADING JOB tfgnn_load_addresses FOR GRAPH TransactionFraud_GNN {
+  DEFINE FILENAME f;
+
+  LOAD f
+    TO VERTEX Address VALUES (
+      $0,  // address_id
+      $1,  // first_seen_seq
+      $2,  // first_seen_ts_ms
+      $3,  // country_code
+      $4,  // region_code
+      $5   // postal_code_prefix
+    )
+    USING SEPARATOR="|";
+}
+
+
+CREATE LOADING JOB tfgnn_load_identity_documents FOR GRAPH TransactionFraud_GNN {
+  DEFINE FILENAME f;
+
+  LOAD f
+    TO VERTEX Identity_Document VALUES (
+      $0,  // document_id
+      $1,  // first_seen_seq
+      $2,  // first_seen_ts_ms
+      $3,  // document_type
+      $4   // issuing_country
+    )
+    USING SEPARATOR="|";
+}
+
+
+/*
+======================================================================
+12-21  SLOWLY CHANGING RELATIONS
+======================================================================
+Every one is (FROM, TO, valid_from_seq, valid_to_seq, confidence,
+source_system), so all ten jobs are the same six positions.
+
+VISIBILITY, from the schema:
+    valid_from_seq <= s.event_seq
+    AND (valid_to_seq == 0 OR s.event_seq < valid_to_seq)
+
+valid_to_seq == 0 means no known end and is the value on nine of the
+ten relations: the source never records an ownership or a PII value
+being given up.
+
+Account_Has_Card is the exception and the only real tenure in this
+schema. Card generations are ordered by the -G<n> reissue suffix, so
+generation n's tenure closes exactly where generation n+1's opens, and
+"which card was in force at this authorization" is answerable.
+
+WHAT valid_from_seq IS NOT. On the other nine it is an OBSERVABILITY
+LOWER BOUND --- max of the two endpoints' first_seen_seq --- because the
+source carries no per-attachment time. Do not build an "<x> at onset"
+feature on those: under a lower-bound stamp they collapse to the party's
+FINAL counts, which is a whole-window leak wearing a point-in-time name,
+and the join succeeds and returns a plausible number.
+======================================================================
+*/
+
+CREATE LOADING JOB tfgnn_load_party_owns_account FOR GRAPH TransactionFraud_GNN {
+  DEFINE FILENAME f;
+
+  LOAD f
+    TO EDGE Party_Owns_Account VALUES (
+      $0,  // FROM Party
+      $1,  // TO Account
+      $2,  // valid_from_seq
+      $3,  // valid_to_seq
+      $4,  // confidence
+      $5   // source_system
+    )
+    USING SEPARATOR="|";
+}
+
+
+CREATE LOADING JOB tfgnn_load_account_has_card FOR GRAPH TransactionFraud_GNN {
+  DEFINE FILENAME f;
+
+  LOAD f
+    TO EDGE Account_Has_Card VALUES (
+      $0,  // FROM Account
+      $1,  // TO Card
+      $2,  // valid_from_seq
+      $3,  // valid_to_seq  --- non-zero on a reissued generation
+      $4,  // confidence
+      $5   // source_system
+    )
+    USING SEPARATOR="|";
+}
+
+
+CREATE LOADING JOB tfgnn_load_party_has_email FOR GRAPH TransactionFraud_GNN {
+  DEFINE FILENAME f;
+
+  LOAD f
+    TO EDGE Party_Has_Email VALUES ($0, $1, $2, $3, $4, $5)
+    USING SEPARATOR="|";
+}
+
+
+CREATE LOADING JOB tfgnn_load_party_has_phone FOR GRAPH TransactionFraud_GNN {
+  DEFINE FILENAME f;
+
+  LOAD f
+    TO EDGE Party_Has_Phone VALUES ($0, $1, $2, $3, $4, $5)
+    USING SEPARATOR="|";
+}
+
+
+CREATE LOADING JOB tfgnn_load_party_has_address FOR GRAPH TransactionFraud_GNN {
+  DEFINE FILENAME f;
+
+  LOAD f
+    TO EDGE Party_Has_Address VALUES ($0, $1, $2, $3, $4, $5)
+    USING SEPARATOR="|";
+}
+
+
+CREATE LOADING JOB tfgnn_load_party_has_identity_document FOR GRAPH TransactionFraud_GNN {
+  DEFINE FILENAME f;
+
+  LOAD f
+    TO EDGE Party_Has_Identity_Document VALUES ($0, $1, $2, $3, $4, $5)
+    USING SEPARATOR="|";
+}
+
+
+CREATE LOADING JOB tfgnn_load_party_has_device FOR GRAPH TransactionFraud_GNN {
+  DEFINE FILENAME f;
+
+  LOAD f
+    TO EDGE Party_Has_Device VALUES ($0, $1, $2, $3, $4, $5)
+    USING SEPARATOR="|";
+}
+
+
+CREATE LOADING JOB tfgnn_load_party_has_ip FOR GRAPH TransactionFraud_GNN {
+  DEFINE FILENAME f;
+
+  LOAD f
+    TO EDGE Party_Has_IP VALUES ($0, $1, $2, $3, $4, $5)
+    USING SEPARATOR="|";
+}
+
+
+CREATE LOADING JOB tfgnn_load_party_operates_merchant FOR GRAPH TransactionFraud_GNN {
+  DEFINE FILENAME f;
+
+  // Direction is Party -> Merchant. The source register runs the other
+  // way (merchant -> proprietor) and the load view flips it.
+  LOAD f
+    TO EDGE Party_Operates_Merchant VALUES ($0, $1, $2, $3, $4, $5)
+    USING SEPARATOR="|";
+}
+
+
+CREATE LOADING JOB tfgnn_load_merchant_has_location FOR GRAPH TransactionFraud_GNN {
+  DEFINE FILENAME f;
+
+  LOAD f
+    TO EDGE Merchant_Has_Location VALUES ($0, $1, $2, $3, $4, $5)
+    USING SEPARATOR="|";
+}
+
+
+/*
+======================================================================
+22  Payment_Transaction AND ITS FOUR PARTICIPATION EDGES
+======================================================================
+PSV columns:
+
+   0 transaction_id        12 is_recurring
+   1 event_time            13 merchant_category_code
+   2 event_ts_ms           14 has_event_location
+   3 event_seq             15 event_latitude
+   4 amount                16 event_longitude
+   5 amount_present        17 device_risk_score
+   6 currency              18 ip_risk_score
+   7 transaction_type      19 fraud_label
+   8 channel               20 label_known
+   9 entry_mode            21 label_available_seq
+  10 card_present          22 label_available_ts_ms
+  11 is_cross_border       23 label_source
+                           24 account_id   <- endpoint keys, not
+                           25 card_id         vertex attributes
+                           26 merchant_id
+                           27 location_id  <- empty for online merchants
+
+$0-$23 are the vertex in schema order. $24-$27 exist only to create the
+edges below; the schema deliberately keeps NO denormalised join keys on
+the fact vertex, so none of them is loaded as an attribute.
+
+fraud_label and label_* ARE SUPERVISION METADATA. The schema is explicit
+that "no model feature/message query may read them". They load here
+because supervision has to come from somewhere; nothing downstream may
+treat them as inputs.
+======================================================================
+*/
+
+CREATE LOADING JOB tfgnn_load_transactions FOR GRAPH TransactionFraud_GNN {
+  DEFINE FILENAME f;
+
+  LOAD f
+    TO VERTEX Payment_Transaction VALUES (
+      $0,   // transaction_id
+      $1,   // event_time            DATETIME, operator readability only
+      $2,   // event_ts_ms           AUTHORITATIVE clock
+      $3,   // event_seq             AUTHORITATIVE order
+      $4,   // amount
+      $5,   // amount_present        separates a real 0.00 from an unloaded amount
+      $6,   // currency
+      $7,   // transaction_type
+      $8,   // channel
+      $9,   // entry_mode
+      $10,  // card_present
+      $11,  // is_cross_border
+      $12,  // is_recurring
+      $13,  // merchant_category_code
+      $14,  // has_event_location
+      $15,  // event_latitude
+      $16,  // event_longitude
+      $17,  // device_risk_score     -1 = unavailable, never 0
+      $18,  // ip_risk_score         -1 = unavailable, never 0
+      $19,  // fraud_label
+      $20,  // label_known
+      $21,  // label_available_seq
+      $22,  // label_available_ts_ms
+      $23   // label_source
+    ),
+
+    TO EDGE Transaction_From_Account VALUES (
+      $0,   // FROM Payment_Transaction
+      $24,  // TO Account --- the initiating/funding account
+      $2,   // event_ts_ms
+      $3    // event_seq
+    ),
+
+    TO EDGE Transaction_Used_Card VALUES (
+      $0,   // FROM Payment_Transaction
+      $25,  // TO Card
+      $2,
+      $3
+    ),
+
+    TO EDGE Transaction_At_Merchant VALUES (
+      $0,   // FROM Payment_Transaction
+      $26,  // TO Merchant --- the receiving side
+      $2,
+      $3
+    ),
+
+    // GUARDED. $27 is empty for a card-not-present merchant, which has
+    // no outlet. Without the WHERE this creates a Merchant_Location whose
+    // primary id is the empty string, on every online authorization.
+    TO EDGE Transaction_At_Location VALUES (
+      $0,   // FROM Payment_Transaction
+      $27,  // TO Merchant_Location
+      $2,
+      $3
+    ) WHERE $27 != ""
+
+    USING SEPARATOR="|";
+}
+
+
+/*
+======================================================================
+23-24  EVENT-TIME ENDPOINTS
+======================================================================
+The relations the previous loader could not build. cf_Has_Device and
+cf_Has_IP are whole-window associations the institution has ON FILE;
+these two say which endpoint the AUTHORIZATION came from.
+
+Both stamps come from the transaction's own event_seq / event_ts_ms, not
+from the source's edge timestamp: there is exactly one clock, and a
+participation edge that disagreed with its own transaction would break
+every cutoff-safe query.
+
+Zero rows is legal --- both are optional endpoints --- and
+tf_gnn_prep.audit_source_counts reports the count so an empty relation is
+a number somebody saw.
+======================================================================
+*/
+
+CREATE LOADING JOB tfgnn_load_transaction_used_device FOR GRAPH TransactionFraud_GNN {
+  DEFINE FILENAME f;
+
+  LOAD f
+    TO EDGE Transaction_Used_Device VALUES (
+      $0,  // FROM Payment_Transaction
+      $1,  // TO Device
+      $2,  // event_ts_ms
+      $3   // event_seq
+    )
+    USING SEPARATOR="|";
+}
+
+
+CREATE LOADING JOB tfgnn_load_transaction_from_ip FOR GRAPH TransactionFraud_GNN {
+  DEFINE FILENAME f;
+
+  LOAD f
+    TO EDGE Transaction_From_IP VALUES (
+      $0,  // FROM Payment_Transaction
+      $1,  // TO IP_Address
+      $2,  // event_ts_ms
+      $3   // event_seq
+    )
+    USING SEPARATOR="|";
+}

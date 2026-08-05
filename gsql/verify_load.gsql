@@ -1,0 +1,730 @@
+/*
+======================================================================
+tfgnn_validate_graph --- TransactionFraud_GNN LOAD VALIDATION
+======================================================================
+
+The schema header names this query as the thing to run before exporting
+or training. It checks what LOADING itself can corrupt, on the loaded
+graph, before any derived state exists.
+
+EDGE COUNTS ARE MEASURED BY TRAVERSAL, NEVER BY outdegree().
+TigerGraph's per-vertex degree statistics (WITH
+STATS="OUTDEGREE_BY_EDGETYPE") are maintained by a background rebuild and
+lag a fresh load --- outdegree() read seconds after loading undercounts,
+down to zero for the last datasets in. Walking the edges reads the real
+store and is exact at any time.
+
+----------------------------------------------------------------------
+WHAT IT CHECKS
+----------------------------------------------------------------------
+
+THE TEMPORAL CONTRACT
+  min(event_seq) == 1, no zeros, max == COUNT(Payment_Transaction), and
+  sum == N(N+1)/2 as the density witness. Ordering against event_ts_ms is
+  asserted in PostgreSQL before export, where it is one window function;
+  here we assert what loading could have broken.
+
+  event_ts_ms == 0 is checked separately. It is the authoritative clock,
+  and a zero would come from an unloaded column rather than from a real
+  1970 authorization.
+
+EVERY PARTICIPATION EDGE REPEATS THE TRANSACTION'S STAMPS
+  The schema requires it, and the whole cutoff discipline rests on it: a
+  sampler filtering edges by event_seq must get the same answer as one
+  filtering the transaction. Any edge whose event_seq or event_ts_ms
+  differs from its own transaction's is counted.
+
+CARDINALITY
+  Exactly one Account and exactly one Merchant per authorization;
+  at most one Card, Merchant_Location, Device and IP_Address.
+
+  Computed from traversal frontier sizes:
+      missing = transactions - frontier size
+      extra   = edges       - frontier size
+  A frontier is the set of transactions REACHED, so it counts each
+  transaction once no matter how many edges it has --- which is what makes
+  the pair separate "none" from "more than one".
+
+  Missing Card is a failure HERE even though the schema says at most one,
+  because this loader derives the Account and the Card from the same
+  source row: a transaction with an Account and no Card means the load
+  dropped edges.
+
+FIRST-SEEN STAMPS
+  No dimension vertex may carry first_seen_seq == 0. TigerGraph upserts
+  an unseen edge endpoint with schema defaults, and 0 passes every
+  first_seen_seq <= cutoff predicate INCLUDING cutoffs from before the
+  entity existed. A non-zero count here is the signature of a load that
+  ran out of order --- edges before their vertices --- and it is the single
+  most damaging silent failure available.
+
+SLOWLY CHANGING INTERVALS
+  valid_from_seq == 0 makes a relation visible before either endpoint
+  existed. valid_to_seq <= valid_from_seq while non-zero makes it visible
+  to nobody. Both are failures and both are invisible in a row count.
+
+  closed_card_tenures is reported, not gated: it is the number of
+  Account_Has_Card rows that actually end, i.e. reissues.
+
+LABEL MATURITY
+  label_known must agree with the availability fields, and a confirmed
+  fraud verdict must become knowable STRICTLY AFTER the event it
+  describes. This is what lets victim-reported scam fraud --- authorised
+  "bail fee" payments the cardholder made themselves --- carry a truthful
+  became-knowable time instead of being treated as known at authorization.
+
+OWNERSHIP CARDINALITY
+  Each Account has at least one owning Party (joint accounts are legal,
+  so several is fine). Each Merchant has at most one operating Party at
+  the high-water mark.
+
+----------------------------------------------------------------------
+The Python verifier (tf_gnn_loader.tigergraph.verify) compares every
+printed count against the export manifest and evaluates the invariants.
+THE KEYS PRINTED HERE ARE A CONTRACT WITH THAT MODULE: asking for a key
+this query does not return is a hard error there, not a skipped check.
+======================================================================
+*/
+
+USE GRAPH TransactionFraud_GNN
+
+CREATE OR REPLACE QUERY tfgnn_validate_graph() FOR GRAPH TransactionFraud_GNN SYNTAX v2 {
+
+  // ---------------------------------------------------------------
+  // Vertex counts
+  // ---------------------------------------------------------------
+
+  SumAccum<INT> @@party_count;
+  SumAccum<INT> @@account_count;
+  SumAccum<INT> @@card_count;
+  SumAccum<INT> @@merchant_count;
+  SumAccum<INT> @@merchant_location_count;
+  SumAccum<INT> @@device_count;
+  SumAccum<INT> @@ip_address_count;
+  SumAccum<INT> @@email_count;
+  SumAccum<INT> @@phone_count;
+  SumAccum<INT> @@address_count;
+  SumAccum<INT> @@identity_document_count;
+  SumAccum<INT> @@payment_transaction_count;
+
+  // ---------------------------------------------------------------
+  // Edge counts, by traversal
+  // ---------------------------------------------------------------
+
+  SumAccum<INT> @@party_owns_account_count;
+  SumAccum<INT> @@account_has_card_count;
+  SumAccum<INT> @@party_has_email_count;
+  SumAccum<INT> @@party_has_phone_count;
+  SumAccum<INT> @@party_has_address_count;
+  SumAccum<INT> @@party_has_identity_document_count;
+  SumAccum<INT> @@party_has_device_count;
+  SumAccum<INT> @@party_has_ip_count;
+  SumAccum<INT> @@party_operates_merchant_count;
+  SumAccum<INT> @@merchant_has_location_count;
+
+  SumAccum<INT> @@transaction_from_account_count;
+  SumAccum<INT> @@transaction_used_card_count;
+  SumAccum<INT> @@transaction_at_merchant_count;
+  SumAccum<INT> @@transaction_at_location_count;
+  SumAccum<INT> @@transaction_used_device_count;
+  SumAccum<INT> @@transaction_from_ip_count;
+
+  // ---------------------------------------------------------------
+  // Event order and clock
+  // ---------------------------------------------------------------
+
+  MinAccum<INT> @@event_seq_min;
+  MaxAccum<INT> @@event_seq_max;
+  SumAccum<INT> @@event_seq_zero_rows;
+  SumAccum<INT> @@event_seq_sum;
+  SumAccum<INT> @@event_ts_ms_zero_rows;
+
+  // ---------------------------------------------------------------
+  // Participation-edge stamp agreement
+  // ---------------------------------------------------------------
+
+  SumAccum<INT> @@edge_stamp_mismatch_rows;
+
+  // ---------------------------------------------------------------
+  // Cardinality
+  // ---------------------------------------------------------------
+
+  SumAccum<INT> @@txn_missing_account_edge;
+  SumAccum<INT> @@txn_multi_account_edge;
+  SumAccum<INT> @@txn_missing_card_edge;
+  SumAccum<INT> @@txn_multi_card_edge;
+  SumAccum<INT> @@txn_missing_merchant_edge;
+  SumAccum<INT> @@txn_multi_merchant_edge;
+  SumAccum<INT> @@txn_multi_location_edge;
+  SumAccum<INT> @@txn_multi_device_edge;
+  SumAccum<INT> @@txn_multi_ip_edge;
+
+  SumAccum<INT> @@accounts_without_owner;
+  SumAccum<INT> @@merchants_with_multiple_operators;
+  SumAccum<INT> @operator_count;
+
+  // ---------------------------------------------------------------
+  // First-seen stamps
+  // ---------------------------------------------------------------
+
+  SumAccum<INT> @@vertices_with_zero_first_seen;
+
+  // ---------------------------------------------------------------
+  // Slowly changing intervals
+  // ---------------------------------------------------------------
+
+  SumAccum<INT> @@relations_with_zero_valid_from;
+  SumAccum<INT> @@relations_with_empty_interval;
+  SumAccum<INT> @@closed_card_tenures;
+
+  // ---------------------------------------------------------------
+  // Label maturity
+  // ---------------------------------------------------------------
+
+  SumAccum<INT> @@label_known_rows;
+  SumAccum<INT> @@label_unknown_rows;
+  SumAccum<INT> @@label_fraud_rows;
+  SumAccum<INT> @@label_out_of_domain_rows;
+  SumAccum<INT> @@label_violation_rows;
+
+  // ---------------------------------------------------------------
+  // Reported, not gated
+  // ---------------------------------------------------------------
+
+  SumAccum<DOUBLE> @@amount_sum;
+  SumAccum<INT> @@amount_absent_rows;
+  SumAccum<INT> @@card_present_rows;
+  SumAccum<INT> @@ecommerce_rows;
+  SumAccum<INT> @@unknown_channel_rows;
+  SumAccum<INT> @@event_location_rows;
+  SumAccum<INT> @@merchant_location_with_coordinates;
+  SumAccum<INT> @@merchant_location_masked;
+  SumAccum<INT> @@online_merchant_count;
+
+  // ===============================================================
+  // Vertex passes. Attribute reads are real-time; only degree
+  // statistics lag a fresh load.
+  // ===============================================================
+
+  transactions =
+      SELECT transaction
+      FROM Payment_Transaction:transaction
+      ACCUM
+        @@payment_transaction_count += 1,
+
+        @@event_seq_min += transaction.event_seq,
+        @@event_seq_max += transaction.event_seq,
+        @@event_seq_sum += transaction.event_seq,
+
+        IF transaction.event_seq == 0 THEN
+          @@event_seq_zero_rows += 1
+        END,
+
+        IF transaction.event_ts_ms == 0 THEN
+          @@event_ts_ms_zero_rows += 1
+        END,
+
+        // Label domain and maturity.
+        IF transaction.fraud_label != 0 AND transaction.fraud_label != 1 THEN
+          @@label_out_of_domain_rows += 1
+        END,
+
+        IF transaction.fraud_label == 1 THEN
+          @@label_fraud_rows += 1
+        END,
+
+        IF transaction.label_known THEN
+          @@label_known_rows += 1
+        ELSE
+          @@label_unknown_rows += 1
+        END,
+
+        // A known label must say when it became knowable, in both
+        // clocks. Either one alone is half a fact.
+        IF transaction.label_known
+           AND (transaction.label_available_seq == 0
+                OR transaction.label_available_ts_ms == 0) THEN
+          @@label_violation_rows += 1
+        END,
+
+        // An unknown label must carry no availability at all, or a
+        // reader would treat the sentinel as a date.
+        IF transaction.label_known == FALSE
+           AND (transaction.label_available_seq != 0
+                OR transaction.label_available_ts_ms != 0
+                OR transaction.label_source != "") THEN
+          @@label_violation_rows += 1
+        END,
+
+        // A fraud verdict lands AFTER the event. Equality would assert
+        // the label was knowable at the authorization request, which is
+        // the one thing it is not.
+        IF transaction.fraud_label == 1
+           AND transaction.label_available_ts_ms <= transaction.event_ts_ms THEN
+          @@label_violation_rows += 1
+        END,
+
+        @@amount_sum += transaction.amount,
+
+        IF transaction.amount_present == FALSE THEN
+          @@amount_absent_rows += 1
+        END,
+
+        IF transaction.card_present THEN
+          @@card_present_rows += 1
+        END,
+
+        IF transaction.channel == "ecommerce" THEN
+          @@ecommerce_rows += 1
+        END,
+
+        IF transaction.channel == "unknown" THEN
+          @@unknown_channel_rows += 1
+        END,
+
+        IF transaction.has_event_location THEN
+          @@event_location_rows += 1
+        END;
+
+  parties =
+      SELECT party FROM Party:party
+      ACCUM
+        @@party_count += 1,
+        IF party.first_seen_seq == 0 THEN
+          @@vertices_with_zero_first_seen += 1
+        END;
+
+  accounts =
+      SELECT account FROM Account:account
+      ACCUM
+        @@account_count += 1,
+        IF account.first_seen_seq == 0 THEN
+          @@vertices_with_zero_first_seen += 1
+        END;
+
+  cards =
+      SELECT card FROM Card:card
+      ACCUM
+        @@card_count += 1,
+        IF card.first_seen_seq == 0 THEN
+          @@vertices_with_zero_first_seen += 1
+        END;
+
+  merchants =
+      SELECT merchant FROM Merchant:merchant
+      ACCUM
+        @@merchant_count += 1,
+        IF merchant.first_seen_seq == 0 THEN
+          @@vertices_with_zero_first_seen += 1
+        END,
+        IF merchant.is_online THEN
+          @@online_merchant_count += 1
+        END;
+
+  // has_coordinates is the only valid test. 0,0 is a real place in the
+  // Gulf of Guinea, so latitude <> 0 would silently reclassify it.
+  locations =
+      SELECT location FROM Merchant_Location:location
+      ACCUM
+        @@merchant_location_count += 1,
+        IF location.first_seen_seq == 0 THEN
+          @@vertices_with_zero_first_seen += 1
+        END,
+        IF location.has_coordinates THEN
+          @@merchant_location_with_coordinates += 1
+        ELSE
+          @@merchant_location_masked += 1
+        END;
+
+  devices =
+      SELECT device FROM Device:device
+      ACCUM
+        @@device_count += 1,
+        IF device.first_seen_seq == 0 THEN
+          @@vertices_with_zero_first_seen += 1
+        END;
+
+  ip_addresses =
+      SELECT ip FROM IP_Address:ip
+      ACCUM
+        @@ip_address_count += 1,
+        IF ip.first_seen_seq == 0 THEN
+          @@vertices_with_zero_first_seen += 1
+        END;
+
+  emails =
+      SELECT email FROM Email:email
+      ACCUM
+        @@email_count += 1,
+        IF email.first_seen_seq == 0 THEN
+          @@vertices_with_zero_first_seen += 1
+        END;
+
+  phones =
+      SELECT phone FROM Phone:phone
+      ACCUM
+        @@phone_count += 1,
+        IF phone.first_seen_seq == 0 THEN
+          @@vertices_with_zero_first_seen += 1
+        END;
+
+  addresses =
+      SELECT address FROM Address:address
+      ACCUM
+        @@address_count += 1,
+        IF address.first_seen_seq == 0 THEN
+          @@vertices_with_zero_first_seen += 1
+        END;
+
+  documents =
+      SELECT document FROM Identity_Document:document
+      ACCUM
+        @@identity_document_count += 1,
+        IF document.first_seen_seq == 0 THEN
+          @@vertices_with_zero_first_seen += 1
+        END;
+
+  // ===============================================================
+  // Participation edges.
+  //
+  // The frontier is the set of transactions REACHED --- once each,
+  // however many edges they have --- which is what separates "none"
+  // from "more than one".
+  // ===============================================================
+
+  with_account =
+      SELECT transaction
+      FROM Payment_Transaction:transaction
+           -(Transaction_From_Account>:participation)- Account:account
+      ACCUM
+        @@transaction_from_account_count += 1,
+        IF participation.event_seq != transaction.event_seq
+           OR participation.event_ts_ms != transaction.event_ts_ms THEN
+          @@edge_stamp_mismatch_rows += 1
+        END;
+
+  with_card =
+      SELECT transaction
+      FROM Payment_Transaction:transaction
+           -(Transaction_Used_Card>:participation)- Card:card
+      ACCUM
+        @@transaction_used_card_count += 1,
+        IF participation.event_seq != transaction.event_seq
+           OR participation.event_ts_ms != transaction.event_ts_ms THEN
+          @@edge_stamp_mismatch_rows += 1
+        END;
+
+  with_merchant =
+      SELECT transaction
+      FROM Payment_Transaction:transaction
+           -(Transaction_At_Merchant>:participation)- Merchant:merchant
+      ACCUM
+        @@transaction_at_merchant_count += 1,
+        IF participation.event_seq != transaction.event_seq
+           OR participation.event_ts_ms != transaction.event_ts_ms THEN
+          @@edge_stamp_mismatch_rows += 1
+        END;
+
+  with_location =
+      SELECT transaction
+      FROM Payment_Transaction:transaction
+           -(Transaction_At_Location>:participation)- Merchant_Location:location
+      ACCUM
+        @@transaction_at_location_count += 1,
+        IF participation.event_seq != transaction.event_seq
+           OR participation.event_ts_ms != transaction.event_ts_ms THEN
+          @@edge_stamp_mismatch_rows += 1
+        END;
+
+  with_device =
+      SELECT transaction
+      FROM Payment_Transaction:transaction
+           -(Transaction_Used_Device>:participation)- Device:device
+      ACCUM
+        @@transaction_used_device_count += 1,
+        IF participation.event_seq != transaction.event_seq
+           OR participation.event_ts_ms != transaction.event_ts_ms THEN
+          @@edge_stamp_mismatch_rows += 1
+        END;
+
+  with_ip =
+      SELECT transaction
+      FROM Payment_Transaction:transaction
+           -(Transaction_From_IP>:participation)- IP_Address:ip
+      ACCUM
+        @@transaction_from_ip_count += 1,
+        IF participation.event_seq != transaction.event_seq
+           OR participation.event_ts_ms != transaction.event_ts_ms THEN
+          @@edge_stamp_mismatch_rows += 1
+        END;
+
+  // Exactly one Account, Card and Merchant.
+  @@txn_missing_account_edge +=
+      @@payment_transaction_count - with_account.size();
+  @@txn_multi_account_edge +=
+      @@transaction_from_account_count - with_account.size();
+
+  @@txn_missing_card_edge +=
+      @@payment_transaction_count - with_card.size();
+  @@txn_multi_card_edge +=
+      @@transaction_used_card_count - with_card.size();
+
+  @@txn_missing_merchant_edge +=
+      @@payment_transaction_count - with_merchant.size();
+  @@txn_multi_merchant_edge +=
+      @@transaction_at_merchant_count - with_merchant.size();
+
+  // At most one. Missing is legal on all three: an online merchant has
+  // no outlet, and device / IP are optional endpoints.
+  @@txn_multi_location_edge +=
+      @@transaction_at_location_count - with_location.size();
+  @@txn_multi_device_edge +=
+      @@transaction_used_device_count - with_device.size();
+  @@txn_multi_ip_edge +=
+      @@transaction_from_ip_count - with_ip.size();
+
+  // ===============================================================
+  // Slowly changing relations.
+  //
+  // Every one gets the same two interval checks, because both failure
+  // modes are invisible in a row count: a zero valid_from is visible to
+  // everyone, an inverted interval is visible to nobody.
+  // ===============================================================
+
+  owned_accounts =
+      SELECT account
+      FROM Party:party -(Party_Owns_Account>:relation)- Account:account
+      ACCUM
+        @@party_owns_account_count += 1,
+        IF relation.valid_from_seq == 0 THEN
+          @@relations_with_zero_valid_from += 1
+        END,
+        IF relation.valid_to_seq != 0
+           AND relation.valid_to_seq <= relation.valid_from_seq THEN
+          @@relations_with_empty_interval += 1
+        END;
+
+  // Joint accounts are legal, so several owners is fine; none is not.
+  @@accounts_without_owner += @@account_count - owned_accounts.size();
+
+  account_cards =
+      SELECT card
+      FROM Account:account -(Account_Has_Card>:relation)- Card:card
+      ACCUM
+        @@account_has_card_count += 1,
+        IF relation.valid_from_seq == 0 THEN
+          @@relations_with_zero_valid_from += 1
+        END,
+        IF relation.valid_to_seq != 0
+           AND relation.valid_to_seq <= relation.valid_from_seq THEN
+          @@relations_with_empty_interval += 1
+        END,
+        IF relation.valid_to_seq != 0 THEN
+          @@closed_card_tenures += 1
+        END;
+
+  party_emails =
+      SELECT value
+      FROM Party:party -(Party_Has_Email>:relation)- Email:value
+      ACCUM
+        @@party_has_email_count += 1,
+        IF relation.valid_from_seq == 0 THEN
+          @@relations_with_zero_valid_from += 1
+        END,
+        IF relation.valid_to_seq != 0
+           AND relation.valid_to_seq <= relation.valid_from_seq THEN
+          @@relations_with_empty_interval += 1
+        END;
+
+  party_phones =
+      SELECT value
+      FROM Party:party -(Party_Has_Phone>:relation)- Phone:value
+      ACCUM
+        @@party_has_phone_count += 1,
+        IF relation.valid_from_seq == 0 THEN
+          @@relations_with_zero_valid_from += 1
+        END,
+        IF relation.valid_to_seq != 0
+           AND relation.valid_to_seq <= relation.valid_from_seq THEN
+          @@relations_with_empty_interval += 1
+        END;
+
+  party_addresses =
+      SELECT value
+      FROM Party:party -(Party_Has_Address>:relation)- Address:value
+      ACCUM
+        @@party_has_address_count += 1,
+        IF relation.valid_from_seq == 0 THEN
+          @@relations_with_zero_valid_from += 1
+        END,
+        IF relation.valid_to_seq != 0
+           AND relation.valid_to_seq <= relation.valid_from_seq THEN
+          @@relations_with_empty_interval += 1
+        END;
+
+  party_documents =
+      SELECT value
+      FROM Party:party
+           -(Party_Has_Identity_Document>:relation)- Identity_Document:value
+      ACCUM
+        @@party_has_identity_document_count += 1,
+        IF relation.valid_from_seq == 0 THEN
+          @@relations_with_zero_valid_from += 1
+        END,
+        IF relation.valid_to_seq != 0
+           AND relation.valid_to_seq <= relation.valid_from_seq THEN
+          @@relations_with_empty_interval += 1
+        END;
+
+  party_devices =
+      SELECT value
+      FROM Party:party -(Party_Has_Device>:relation)- Device:value
+      ACCUM
+        @@party_has_device_count += 1,
+        IF relation.valid_from_seq == 0 THEN
+          @@relations_with_zero_valid_from += 1
+        END,
+        IF relation.valid_to_seq != 0
+           AND relation.valid_to_seq <= relation.valid_from_seq THEN
+          @@relations_with_empty_interval += 1
+        END;
+
+  party_ips =
+      SELECT value
+      FROM Party:party -(Party_Has_IP>:relation)- IP_Address:value
+      ACCUM
+        @@party_has_ip_count += 1,
+        IF relation.valid_from_seq == 0 THEN
+          @@relations_with_zero_valid_from += 1
+        END,
+        IF relation.valid_to_seq != 0
+           AND relation.valid_to_seq <= relation.valid_from_seq THEN
+          @@relations_with_empty_interval += 1
+        END;
+
+  operated_merchants =
+      SELECT merchant
+      FROM Party:party
+           -(Party_Operates_Merchant>:relation)- Merchant:merchant
+      ACCUM
+        @@party_operates_merchant_count += 1,
+        merchant.@operator_count += 1,
+        IF relation.valid_from_seq == 0 THEN
+          @@relations_with_zero_valid_from += 1
+        END,
+        IF relation.valid_to_seq != 0
+           AND relation.valid_to_seq <= relation.valid_from_seq THEN
+          @@relations_with_empty_interval += 1
+        END;
+
+  // "At the graph high-water mark, each Merchant has exactly one
+  // cutoff-visible operating Party." Historical non-overlapping tenures
+  // may coexist, so this counts merchants with more than one OPEN-ended
+  // operator rather than more than one edge --- but this loader emits no
+  // closed operator tenure, so the two coincide today and the check is
+  // written on the edge count.
+  multi_operator_merchants =
+      SELECT merchant
+      FROM Merchant:merchant
+      WHERE merchant.@operator_count > 1
+      ACCUM
+        @@merchants_with_multiple_operators += 1;
+
+  merchant_locations =
+      SELECT location
+      FROM Merchant:merchant
+           -(Merchant_Has_Location>:relation)- Merchant_Location:location
+      ACCUM
+        @@merchant_has_location_count += 1,
+        IF relation.valid_from_seq == 0 THEN
+          @@relations_with_zero_valid_from += 1
+        END,
+        IF relation.valid_to_seq != 0
+           AND relation.valid_to_seq <= relation.valid_from_seq THEN
+          @@relations_with_empty_interval += 1
+        END;
+
+  // ===============================================================
+  // Output. These keys are a contract with
+  // tf_gnn_loader.tigergraph.verify.
+  // ===============================================================
+
+  PRINT
+    @@party_count AS Party,
+    @@account_count AS Account,
+    @@card_count AS Card,
+    @@merchant_count AS Merchant,
+    @@merchant_location_count AS Merchant_Location,
+    @@device_count AS Device,
+    @@ip_address_count AS IP_Address,
+    @@email_count AS Email,
+    @@phone_count AS Phone,
+    @@address_count AS Address,
+    @@identity_document_count AS Identity_Document,
+    @@payment_transaction_count AS Payment_Transaction;
+
+  PRINT
+    @@party_owns_account_count AS Party_Owns_Account,
+    @@account_has_card_count AS Account_Has_Card,
+    @@party_has_email_count AS Party_Has_Email,
+    @@party_has_phone_count AS Party_Has_Phone,
+    @@party_has_address_count AS Party_Has_Address,
+    @@party_has_identity_document_count AS Party_Has_Identity_Document,
+    @@party_has_device_count AS Party_Has_Device,
+    @@party_has_ip_count AS Party_Has_IP,
+    @@party_operates_merchant_count AS Party_Operates_Merchant,
+    @@merchant_has_location_count AS Merchant_Has_Location,
+    @@transaction_from_account_count AS Transaction_From_Account,
+    @@transaction_used_card_count AS Transaction_Used_Card,
+    @@transaction_at_merchant_count AS Transaction_At_Merchant,
+    @@transaction_at_location_count AS Transaction_At_Location,
+    @@transaction_used_device_count AS Transaction_Used_Device,
+    @@transaction_from_ip_count AS Transaction_From_IP;
+
+  PRINT
+    @@event_seq_min AS event_seq_min,
+    @@event_seq_max AS event_seq_max,
+    @@event_seq_zero_rows AS event_seq_zero_rows,
+    @@event_seq_sum AS event_seq_sum,
+    @@event_ts_ms_zero_rows AS event_ts_ms_zero_rows,
+    @@edge_stamp_mismatch_rows AS edge_stamp_mismatch_rows;
+
+  PRINT
+    @@txn_missing_account_edge AS txn_missing_account_edge,
+    @@txn_multi_account_edge AS txn_multi_account_edge,
+    @@txn_missing_card_edge AS txn_missing_card_edge,
+    @@txn_multi_card_edge AS txn_multi_card_edge,
+    @@txn_missing_merchant_edge AS txn_missing_merchant_edge,
+    @@txn_multi_merchant_edge AS txn_multi_merchant_edge,
+    @@txn_multi_location_edge AS txn_multi_location_edge,
+    @@txn_multi_device_edge AS txn_multi_device_edge,
+    @@txn_multi_ip_edge AS txn_multi_ip_edge,
+    @@accounts_without_owner AS accounts_without_owner,
+    @@merchants_with_multiple_operators AS merchants_with_multiple_operators;
+
+  PRINT
+    @@vertices_with_zero_first_seen AS vertices_with_zero_first_seen,
+    @@relations_with_zero_valid_from AS relations_with_zero_valid_from,
+    @@relations_with_empty_interval AS relations_with_empty_interval,
+    @@closed_card_tenures AS closed_card_tenures;
+
+  PRINT
+    @@label_known_rows AS label_known_rows,
+    @@label_unknown_rows AS label_unknown_rows,
+    @@label_fraud_rows AS label_fraud_rows,
+    @@label_out_of_domain_rows AS label_out_of_domain_rows,
+    @@label_violation_rows AS label_violation_rows;
+
+  PRINT
+    @@amount_sum AS amount_sum,
+    @@amount_absent_rows AS amount_absent_rows,
+    @@card_present_rows AS card_present_rows,
+    @@ecommerce_rows AS ecommerce_rows,
+    @@unknown_channel_rows AS unknown_channel_rows,
+    @@event_location_rows AS event_location_rows,
+    @@online_merchant_count AS online_merchant_count,
+    @@merchant_location_with_coordinates AS merchant_location_with_coordinates,
+    @@merchant_location_masked AS merchant_location_masked;
+}
+
+INSTALL QUERY tfgnn_validate_graph
