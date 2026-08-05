@@ -89,7 +89,21 @@ _RETRYABLE_HTTP_STATUS_CODES = frozenset(
 _MINIMUM_SIZE_LIMIT_BYTES = 128_000_000
 _SIZE_LIMIT_PADDING_BYTES = 1_000_000
 
-_EXPECTED_MANIFEST_FORMAT_VERSION = 1
+# Must equal the "format_version" that
+# tf_gnn_loader.postgres.export.export_all writes. Check 12 in
+# scripts/check_loader_contracts.py compares the two, because the writer
+# and the reader living in different modules is exactly how they drift ---
+# and they did: the TransactionFraud_GNN retarget bumped the writer to 2
+# and left this at 1, so `load` rejected the manifest `export` had just
+# produced, at step 5 of 6.
+#
+# VERSION 2 MEANS "TARGETS TransactionFraud_GNN". The file's SHAPE is
+# unchanged from version 1, so the bump is not describing a structural
+# change --- it exists to make a leftover version-1 manifest from the old
+# TF_GNN pipeline unloadable. Such a file names 42 datasets and loading
+# jobs that no longer exist, and rejecting it here gives a clear message
+# instead of 42 confusing "missing dataset" errors in _preflight.
+_EXPECTED_MANIFEST_FORMAT_VERSION = 2
 
 # A fresh export must not be appended to a graph that already contains
 # loaded data. This is every vertex type the schema declares --- all 12 ---
@@ -726,8 +740,21 @@ def _validate_manifest(
     )
 
     if format_version != _EXPECTED_MANIFEST_FORMAT_VERSION:
+        remedy = (
+            "It was written by the superseded TF_GNN pipeline and names "
+            "datasets and loading jobs that no longer exist. Re-run "
+            "`tf-gnn-load export`."
+            if format_version < _EXPECTED_MANIFEST_FORMAT_VERSION
+            else "It was written by a newer version of this loader."
+        )
+
         raise RuntimeError(
-            "Unsupported export manifest " + "format_version: " + str(format_version)
+            "Unsupported export manifest format_version: "
+            + str(format_version)
+            + " (expected "
+            + str(_EXPECTED_MANIFEST_FORMAT_VERSION)
+            + "). "
+            + remedy
         )
 
     graphname = _string(

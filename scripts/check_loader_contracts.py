@@ -38,6 +38,14 @@ message that does not name the file that caused it:
   11. No forbidden attributes   The schema declares no split, protected or
                                 response-time attribute, so no loading job
                                 may name one.
+  12. Manifest format version   export.py WRITES the version that
+                                loading.py READS. They live in different
+                                modules, and they drifted once already:
+                                the retarget bumped the writer to 2 and
+                                left the reader at 1, so `load` rejected
+                                the manifest `export` had just written ---
+                                after prepare, audit and export had all
+                                succeeded.
 
 Exit status is non-zero if any check fails, so this is CI-usable.
 """
@@ -56,6 +64,7 @@ VERIFY_QUERY = ROOT / "gsql" / "verify_load.gsql"
 LOAD_VIEWS = ROOT / "sql" / "postgres" / "080_create_load_views.sql"
 EXPORT_PY = ROOT / "src" / "tf_gnn_loader" / "postgres" / "export.py"
 TG_VERIFY_PY = ROOT / "src" / "tf_gnn_loader" / "tigergraph" / "verify.py"
+TG_LOADING_PY = ROOT / "src" / "tf_gnn_loader" / "tigergraph" / "loading.py"
 PG_VERIFY_PY = ROOT / "src" / "tf_gnn_loader" / "postgres" / "verify.py"
 SQL_DIR = ROOT / "sql" / "postgres"
 
@@ -394,6 +403,30 @@ def main() -> int:
                 f"loading_jobs.gsql mentions {token!r}, which the "
                 "TransactionFraud_GNN schema does not declare",
             )
+
+    # ---- 12. manifest format version: writer vs reader ----
+    print("12. export.py manifest format_version matches loading.py")
+
+    written = re.search(r'"format_version":\s*(\d+)', export_py)
+    expected = re.search(
+        r"_EXPECTED_MANIFEST_FORMAT_VERSION\s*=\s*(\d+)",
+        TG_LOADING_PY.read_text(encoding="utf-8"),
+    )
+
+    if written is None:
+        fail("manifest-version", "export.py writes no format_version")
+    elif expected is None:
+        fail(
+            "manifest-version",
+            "loading.py declares no _EXPECTED_MANIFEST_FORMAT_VERSION",
+        )
+    elif written.group(1) != expected.group(1):
+        fail(
+            "manifest-version",
+            f"export.py writes format_version {written.group(1)}, "
+            f"loading.py expects {expected.group(1)}; `load` would reject "
+            "the manifest `export` produces",
+        )
 
     print()
 
