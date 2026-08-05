@@ -62,34 +62,34 @@ class Settings(BaseSettings):
     @classmethod
     def validate_pii_salt(cls, value: SecretStr) -> SecretStr:
         """
-        Refuse to run without a usable salt.
+        Validate the salt if one is given, but do not require one here.
 
-        The TransactionFraud_GNN schema requires tokenized PII primary
-        ids, and the salt is the whole defence: a phone number or an email
-        address carries little enough entropy that an unsalted digest is
-        recoverable by dictionary search. A default would be worse than
-        nothing, because it would be in this file.
+        REQUIRING IT AT CONSTRUCTION WAS WRONG. Settings is built by every
+        PostgreSQL subcommand, so a hard requirement here made
+        `tf-gnn-load inspect` --- read-only, and it never reads a PII
+        VALUE, only table metadata --- fail on a missing salt. That is a
+        confusing error at a step that does not need the thing it is
+        asking for.
 
-        THE SALT MUST BE STABLE ACROSS RUNS. Changing it changes every
-        Device, IP_Address, Email, Phone, Address and Identity_Document
-        primary id, which silently re-keys the graph. 020 records its
-        digest and refuses a mismatch, but the place to keep it safe is
-        wherever secrets are kept.
+        The salt is needed by exactly one step: `prepare`, which
+        materialises the token tables in
+        sql/postgres/060_create_pii_views.sql. tf_gnn_loader.postgres.prepare
+        demands it there, and 020_create_policies.sql refuses on the
+        PostgreSQL side as the backstop, so a session that reached the
+        database some other way still cannot build unsalted tokens.
+
+        `export` does NOT need it: the load views read the materialised
+        token tables and never call tf_gnn_prep.pii_token.
+
+        A LENGTH FLOOR STILL APPLIES WHEN A SALT IS GIVEN. A phone number
+        or an email address carries little enough entropy that an
+        eight-character salt is searchable, and a salt that is present but
+        too weak is the failure nobody notices.
         """
 
         raw = value.get_secret_value().strip()
 
-        if not raw:
-            raise ValueError(
-                "TFGNN_PII_SALT must be set. The schema requires email, "
-                "phone, address, identity-document, device and IP "
-                "primary ids to be salted before loading. Generate one "
-                'with `python -c "import secrets; '
-                'print(secrets.token_urlsafe(32))"` and store it with '
-                "your other secrets: re-keying orphans an existing load."
-            )
-
-        if len(raw) < 16:
+        if raw and len(raw) < 16:
             raise ValueError(
                 "TFGNN_PII_SALT must be at least 16 characters; a short "
                 "salt is dictionary-searchable."
