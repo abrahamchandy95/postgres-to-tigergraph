@@ -384,6 +384,10 @@ class _ShardWriter:
         return self._records.copy()
 
 
+# Shared by additional source adapters; retain the private name for compatibility.
+ShardWriter = _ShardWriter
+
+
 def _assert_prepared_views_exist(
     conn: Connection[tuple[object, ...]],
 ) -> None:

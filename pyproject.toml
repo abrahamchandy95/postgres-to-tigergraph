@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tf-gnn-loader"
-version = "0.3.0"
-description = "Prepare PhantomLedger PostgreSQL data and load it into TigerGraph TransactionFraud_GNN"
+version = "0.4.0"
+description = "Load PhantomLedger card-fraud and temporal mule PostgreSQL data into TigerGraph"
 requires-python = ">=3.11"
 dependencies = [
   "psycopg[binary]>=3.2,<4",

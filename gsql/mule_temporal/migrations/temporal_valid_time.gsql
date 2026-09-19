@@ -1,0 +1,201 @@
+/*
+Upgrade the previously deployed EMPTY six-vertex schema in place.
+Historical reference only; this loader never runs this migration automatically.
+Preconditions: every vertex count is zero; no queries/loading jobs; the exact
+old catalog has been independently checked against an archived pre-migration
+snapshot. That snapshot must come from the schema owner before using this file.
+Never use this migration on populated data. No graph/database is dropped.
+Forward-edge removal also removes its paired reverse edge.
+*/
+USE GRAPH Mule_Pattern_Learner
+CREATE SCHEMA_CHANGE JOB upgrade_temporal_valid_time FOR GRAPH Mule_Pattern_Learner {
+  DROP EDGE Party_Has_Account;
+  DROP EDGE Party_Has_Token;
+  DROP EDGE Token_Resolves_To_Account;
+  DROP EDGE Has_Device;
+  DROP EDGE Has_IP;
+  DROP EDGE Account_Sent_Payment;
+  DROP EDGE Payment_To_Account;
+  DROP EDGE Payment_From_Token;
+  DROP EDGE Payment_To_Token;
+  DROP EDGE Payment_Used_Device;
+  DROP EDGE Payment_Used_IP;
+  DROP VERTEX Payment_Token;
+
+  ALTER VERTEX Party ADD ATTRIBUTE (first_seen_seq UINT, first_seen_ts_ms UINT);
+  ALTER VERTEX Account ADD ATTRIBUTE (first_seen_seq UINT, first_seen_ts_ms UINT);
+  ALTER VERTEX Device ADD ATTRIBUTE (first_seen_seq UINT, first_seen_ts_ms UINT);
+  ALTER VERTEX IP ADD ATTRIBUTE (first_seen_seq UINT, first_seen_ts_ms UINT);
+  ALTER VERTEX Payment_Transaction DROP ATTRIBUTE (
+    transaction_time, transaction_ts_ms, status, delta_t_ms, time_encoding_64
+  );
+  ALTER VERTEX Payment_Transaction ADD ATTRIBUTE (
+    event_time DATETIME, event_ts_ms UINT, event_seq UINT,
+    amount_present BOOL DEFAULT "false"
+  );
+
+  ADD VERTEX Token (
+    PRIMARY_ID token_id STRING,
+    first_seen_seq UINT,
+    first_seen_ts_ms UINT,
+    token_kind STRING DEFAULT "unknown",
+    token_network STRING DEFAULT "unknown"
+  ) WITH PRIMARY_ID_AS_ATTRIBUTE="true", STATS="OUTDEGREE_BY_EDGETYPE";
+
+  ADD VERTEX Address (
+    PRIMARY_ID address_id STRING,
+    first_seen_seq UINT,
+    first_seen_ts_ms UINT,
+    country_code STRING DEFAULT ""
+  ) WITH PRIMARY_ID_AS_ATTRIBUTE="true", STATS="OUTDEGREE_BY_EDGETYPE";
+
+  ADD VERTEX Zelle_Transfer (
+    PRIMARY_ID transfer_id STRING,
+    event_time DATETIME,
+    event_ts_ms UINT,
+    event_seq UINT,
+    amount DOUBLE DEFAULT 0.0,
+    amount_present BOOL DEFAULT "false",
+    currency STRING DEFAULT "",
+    channel STRING DEFAULT "unknown",
+    fraud_label INT DEFAULT -1,
+    label_known BOOL DEFAULT "false",
+    label_available_seq UINT DEFAULT 0,
+    label_available_ts_ms UINT DEFAULT 0
+  ) WITH PRIMARY_ID_AS_ATTRIBUTE="true", STATS="OUTDEGREE_BY_EDGETYPE";
+
+  /* Valid-time association tenures. */
+
+  ADD DIRECTED EDGE Party_Owns_Account (
+    FROM Party, TO Account,
+    DISCRIMINATOR(valid_from_seq UINT),
+    valid_to_seq UINT DEFAULT 0,
+    confidence FLOAT DEFAULT 1.0,
+    source_system STRING DEFAULT ""
+  ) WITH REVERSE_EDGE="Account_Owned_By_Party";
+
+  ADD DIRECTED EDGE Party_Uses_Token (
+    FROM Party, TO Token,
+    DISCRIMINATOR(valid_from_seq UINT),
+    valid_to_seq UINT DEFAULT 0,
+    confidence FLOAT DEFAULT 1.0,
+    source_system STRING DEFAULT ""
+  ) WITH REVERSE_EDGE="Token_Used_By_Party";
+
+  ADD DIRECTED EDGE Token_Bound_To_Account (
+    FROM Token, TO Account,
+    DISCRIMINATOR(valid_from_seq UINT),
+    valid_to_seq UINT DEFAULT 0,
+    confidence FLOAT DEFAULT 1.0,
+    source_system STRING DEFAULT ""
+  ) WITH REVERSE_EDGE="Account_Bound_From_Token";
+
+  ADD DIRECTED EDGE Party_Uses_Device (
+    FROM Party, TO Device,
+    DISCRIMINATOR(valid_from_seq UINT),
+    valid_to_seq UINT DEFAULT 0,
+    confidence FLOAT DEFAULT 1.0,
+    source_system STRING DEFAULT ""
+  ) WITH REVERSE_EDGE="Device_Used_By_Party";
+
+  ADD DIRECTED EDGE Account_Uses_Device (
+    FROM Account, TO Device,
+    DISCRIMINATOR(valid_from_seq UINT),
+    valid_to_seq UINT DEFAULT 0,
+    confidence FLOAT DEFAULT 1.0,
+    source_system STRING DEFAULT ""
+  ) WITH REVERSE_EDGE="Device_Used_By_Account";
+
+  ADD DIRECTED EDGE Party_Uses_IP (
+    FROM Party, TO IP,
+    DISCRIMINATOR(valid_from_seq UINT),
+    valid_to_seq UINT DEFAULT 0,
+    confidence FLOAT DEFAULT 1.0,
+    source_system STRING DEFAULT ""
+  ) WITH REVERSE_EDGE="IP_Used_By_Party";
+
+  ADD DIRECTED EDGE Party_Has_Address (
+    FROM Party, TO Address,
+    DISCRIMINATOR(valid_from_seq UINT),
+    valid_to_seq UINT DEFAULT 0,
+    confidence FLOAT DEFAULT 1.0,
+    source_system STRING DEFAULT ""
+  ) WITH REVERSE_EDGE="Address_Used_By_Party";
+
+  /* Point-event participation, with explicit roles and repeated clocks. */
+
+  ADD DIRECTED EDGE Transfer_From_Account (
+    FROM Zelle_Transfer, TO Account,
+    event_ts_ms UINT,
+    event_seq UINT
+  ) WITH REVERSE_EDGE="Account_Sent_Zelle_Transfer";
+
+  ADD DIRECTED EDGE Transfer_To_Account (
+    FROM Zelle_Transfer, TO Account,
+    event_ts_ms UINT,
+    event_seq UINT
+  ) WITH REVERSE_EDGE="Account_Received_Zelle_Transfer";
+
+  ADD DIRECTED EDGE Transfer_From_Token (
+    FROM Zelle_Transfer, TO Token,
+    event_ts_ms UINT,
+    event_seq UINT
+  ) WITH REVERSE_EDGE="Token_Sent_Transfer";
+
+  ADD DIRECTED EDGE Transfer_To_Token (
+    FROM Zelle_Transfer, TO Token,
+    event_ts_ms UINT,
+    event_seq UINT
+  ) WITH REVERSE_EDGE="Token_Received_Transfer";
+
+  ADD DIRECTED EDGE Transfer_Used_Device (
+    FROM Zelle_Transfer, TO Device,
+    event_ts_ms UINT,
+    event_seq UINT
+  ) WITH REVERSE_EDGE="Device_Used_By_Transfer";
+
+  ADD DIRECTED EDGE Transfer_Used_IP (
+    FROM Zelle_Transfer, TO IP,
+    event_ts_ms UINT,
+    event_seq UINT
+  ) WITH REVERSE_EDGE="IP_Used_By_Transfer";
+
+  ADD DIRECTED EDGE Transaction_From_Account (
+    FROM Payment_Transaction, TO Account,
+    event_ts_ms UINT,
+    event_seq UINT
+  ) WITH REVERSE_EDGE="Account_Initiated_Transaction";
+
+  ADD DIRECTED EDGE Transaction_To_Account (
+    FROM Payment_Transaction, TO Account,
+    event_ts_ms UINT,
+    event_seq UINT
+  ) WITH REVERSE_EDGE="Account_Received_Transaction";
+
+  ADD DIRECTED EDGE Transaction_From_Token (
+    FROM Payment_Transaction, TO Token,
+    event_ts_ms UINT,
+    event_seq UINT
+  ) WITH REVERSE_EDGE="Token_Sent_Transaction";
+
+  ADD DIRECTED EDGE Transaction_To_Token (
+    FROM Payment_Transaction, TO Token,
+    event_ts_ms UINT,
+    event_seq UINT
+  ) WITH REVERSE_EDGE="Token_Received_Transaction";
+
+  ADD DIRECTED EDGE Transaction_Used_Device (
+    FROM Payment_Transaction, TO Device,
+    event_ts_ms UINT,
+    event_seq UINT
+  ) WITH REVERSE_EDGE="Device_Used_By_Transaction";
+
+  ADD DIRECTED EDGE Transaction_Used_IP (
+    FROM Payment_Transaction, TO IP,
+    event_ts_ms UINT,
+    event_seq UINT
+  ) WITH REVERSE_EDGE="IP_Observed_In_Transaction";
+}
+
+RUN SCHEMA_CHANGE JOB upgrade_temporal_valid_time
+DROP JOB upgrade_temporal_valid_time

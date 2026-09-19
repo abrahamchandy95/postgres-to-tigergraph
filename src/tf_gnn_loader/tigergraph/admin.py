@@ -266,6 +266,9 @@ def install_verify_query(
     }
 
 
+assert_gsql_succeeded = _assert_gsql_succeeded
+
+
 def main() -> int:
     """Install loading jobs and the verify query without requiring cli.py."""
 

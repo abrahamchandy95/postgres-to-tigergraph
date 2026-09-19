@@ -1,4 +1,20 @@
-# PhantomLedger PostgreSQL → TigerGraph `TransactionFraud_GNN`
+# PhantomLedger PostgreSQL → TigerGraph
+
+Two use cases are available: the original card-fraud pipeline (the default)
+and [temporal mule detection](docs/mule_temporal.md), targeting
+`Mule_Pattern_Learner` with the supplied temporal/Zelle schema.
+
+```bash
+tf-gnn-load --use-case mule-temporal push
+```
+
+The temporal pipeline reads the 27 `mule_temporal.mt_*` tables using
+`MULE_PG_DSN` from `.env`, checks the full temporal contract, exports immutable
+shards, installs loading jobs, uploads resumably, and verifies forward/reverse
+edge counts and clocks. Its output directory is `MULE_EXPORT_DIR`. It reuses
+`HOST`, `GRAPHNAME`, and `SECRET`. See [.env.example](.env.example).
+
+## Card-fraud use case
 
 Loads the PhantomLedger card-fraud corpus into the `TransactionFraud_GNN`
 graph: the schema in [gsql/schema/schema.gsql](gsql/schema/schema.gsql),

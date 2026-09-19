@@ -13,7 +13,7 @@ from concurrent.futures import (
 )
 from functools import partial
 import socket
-from typing import cast
+from typing import TypedDict, cast
 
 import requests
 from pyTigerGraph import TigerGraphConnection
@@ -29,8 +29,13 @@ from tf_gnn_loader.tigergraph.settings import Settings
 # instead of the real HTTP error. Class-level defaults keep that
 # recovery path harmless; __init__ overwrites them on the instance
 # immediately after the ping.
-TigerGraphConnection.restppPort = "443"
-TigerGraphConnection.gsPort = "443"
+setattr(TigerGraphConnection, "restppPort", "443")
+setattr(TigerGraphConnection, "gsPort", "443")
+
+
+class _PortOptions(TypedDict, total=False):
+    restppPort: str
+    gsPort: str
 
 
 # TigerGraph query execution ceiling:
@@ -58,7 +63,7 @@ class Client:
 
         # Savanna serves REST++ and GSQL on 443; the library's 9000 /
         # 14240 defaults only apply to self-managed instances.
-        port_kwargs: dict[str, str] = (
+        port_kwargs: _PortOptions = (
             {"restppPort": "443", "gsPort": "443"}
             if "tgcloud.io" in settings.host.lower()
             else {}

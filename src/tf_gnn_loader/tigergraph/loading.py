@@ -1290,6 +1290,14 @@ def load(
     return report
 
 
+# Public transport/artifact primitives shared by additional graph use cases.
+read_json = _read_json
+write_json_atomic = _write_json_atomic
+sha256 = _sha256
+run_loading_job_with_file = _run_loading_job_with_file
+validate_loading_response = _validate_loading_response
+
+
 def main() -> int:
     """Run the loader without requiring cli.py."""
 

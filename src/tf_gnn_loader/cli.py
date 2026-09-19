@@ -30,7 +30,13 @@ from tf_gnn_loader.tigergraph.verify import (
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
-        description=("Prepare PhantomLedger data and load it into TransactionFraud_GNN")
+        description="Load PhantomLedger card-fraud or temporal mule data into TigerGraph"
+    )
+    result.add_argument(
+        "--use-case",
+        choices=("transaction-fraud", "mule-temporal"),
+        default="transaction-fraud",
+        help="Source/schema contract (default: transaction-fraud)",
     )
 
     commands = result.add_subparsers(
@@ -51,14 +57,12 @@ def parser() -> argparse.ArgumentParser:
 
     commands.add_parser(
         "prepare",
-        help=(
-            "Run the versioned PostgreSQL validation, split, view, and audit SQL files"
-        ),
+        help="Prepare or validate the selected PostgreSQL source contract",
     )
 
     commands.add_parser(
         "audit",
-        help="Verify the prepared PostgreSQL split and load views",
+        help="Audit PostgreSQL data against the selected use case",
     )
 
     commands.add_parser(
@@ -73,7 +77,7 @@ def parser() -> argparse.ArgumentParser:
 
     commands.add_parser(
         "install-jobs",
-        help="Install the TigerGraph loading jobs and tfgnn_validate_graph",
+        help="Install the selected loading jobs and graph validation query",
     )
 
     commands.add_parser(
@@ -83,7 +87,7 @@ def parser() -> argparse.ArgumentParser:
 
     commands.add_parser(
         "verify",
-        help="Verify the resulting TransactionFraud_GNN graph",
+        help="Verify the selected TigerGraph graph against its export",
     )
 
     commands.add_parser(
@@ -91,7 +95,7 @@ def parser() -> argparse.ArgumentParser:
         help=(
             "Run the whole pipeline: prepare, audit, export, install "
             "jobs and validation query, load, verify. The "
-            "TransactionFraud_GNN schema must already exist "
+            "selected graph schema must already exist "
             "(see schema-path)."
         ),
     )
@@ -174,6 +178,12 @@ def main(
     argv: Sequence[str] | None = None,
 ) -> int:
     args = parser().parse_args(argv)
+
+    if args.use_case == "mule-temporal":
+        from tf_gnn_loader.mule.pipeline import run
+
+        print(json.dumps(run(args.command), indent=2, default=str))
+        return 0
 
     command = cast(
         str,
