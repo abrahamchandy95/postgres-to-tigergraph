@@ -1,7 +1,7 @@
 /*
 Mule detection and Zelle transfer schema. Target: TigerGraph 4.2.5.
-Fresh-graph DDL only; never run it on a populated graph. The one-off migrations
-that brought the populated graph to this schema are kept in git history.
+Fresh-graph DDL only; never run it on a populated graph: a new schema means a new
+graph, loaded again.
 
 One Zelle_Transfer vertex represents one individual Zelle payment. Other rails
 use Payment_Transaction; never duplicate a Zelle transfer in both event types.

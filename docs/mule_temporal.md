@@ -147,7 +147,7 @@ MULE_TEST_DSN='dbname=phantomledger' python -m unittest discover -s tests
    assert settings.graphname == "Mule_Pattern_Learner", settings.graphname
    conn = Client(settings).conn
    for vertex_type in conn.getVertexTypes():
-       print(vertex_type, conn.delVertices(vertex_type))
+       print(vertex_type, conn.delVertices(vertex_type, timeout=3600))
    print(conn.getVertexCount("*", realtime=True))
    EOF
    ```
