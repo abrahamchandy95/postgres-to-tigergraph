@@ -132,7 +132,7 @@ MULE_TEST_DSN='dbname=phantomledger' python -m unittest discover -s tests
 ## A fresh push
 
 1. **Regenerate** with PhantomLedger `--usecase mule-temporal` (commit
-   `afbb83a` or later), point `MULE_PG_DSN` at it, and run `inspect`. A bad
+   `525708f` or later), point `MULE_PG_DSN` at it, and run `inspect`. A bad
    table stops with `Source contract mismatch` and the columns found.
 2. **Delete every vertex** in `Mule_Pattern_Learner`, `Temporal_Training_Scope`
    included; the schema, jobs and queries stay. A request may outlast the
