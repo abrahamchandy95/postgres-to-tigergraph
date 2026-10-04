@@ -22,7 +22,17 @@ from .contract import (
     GRAPH,
     SOURCE_SCHEMA,
     VERTICES,
+    Dataset,
 )
+
+PG_TYPES = {
+    "UINT": "numeric(20,0)",
+    "INT": "integer",
+    "DOUBLE": "double precision",
+    "FLOAT": "real",
+    "BOOL": "boolean",
+    "DATETIME": "timestamp",
+}
 
 
 def _execute(conn: Connection[Any], query: str) -> Any:
@@ -36,6 +46,59 @@ def current_database(conn: Connection[Any]) -> str:
     return str(row[0])
 
 
+def view_query(d: Dataset, source: str = "") -> str:
+    """The typed session-local view over one text staging table.
+
+    A nullable STRING column reads NULL as the empty string, its default.
+    """
+    expressions = []
+    for name, kind in d.fields:
+        column = f"coalesce(\"{name}\", '')" if name in d.nullable else f'"{name}"'
+        expressions.append(f'{column}::{PG_TYPES.get(kind, "text")} AS "{name}"')
+    return (
+        f'CREATE TEMP VIEW "mt_{d.name}" AS SELECT '
+        + ",".join(expressions)
+        + f" FROM {source or d.table}"
+    )
+
+
+def invalid_source_values(d: Dataset) -> list[str]:
+    """Predicates on the raw table, each marking a value the export cannot carry."""
+    # TEXT COPY is safe only for single-line, unescaped PSV values.
+    invalid = []
+    for name, kind in d.fields:
+        col = f'"{name}"'
+        if name not in d.nullable:
+            invalid.append(f"{col} IS NULL")
+        if kind == "UINT":
+            invalid.append(f"{col} !~ '^[0-9]+$'")
+        elif kind == "BOOL":
+            invalid.append(f"lower({col}) NOT IN ('true','false')")
+        elif kind == "INT":
+            invalid.append(f"{col} !~ '^-?[0-9]+$'")
+        elif kind == "STRING":
+            invalid.append(f"{col} ~ E'[|\\\\\\\\\\r\\n\\t\"]'")
+    return invalid
+
+
+def copy_query(d: Dataset) -> str:
+    """Export one typed view as header-less PSV.
+
+    Every BOOL column, is_external and the Account label flags alike, leaves
+    as lowercase true or false whatever case the source used (PhantomLedger
+    renders True and False). NULL leaves as an empty field.
+    """
+    columns = []
+    for name, kind in d.fields:
+        if kind == "BOOL":
+            columns.append(f"CASE WHEN {name} THEN 'true' ELSE 'false' END")
+        elif kind == "DATETIME":
+            columns.append(f"to_char({name},'YYYY-MM-DD HH24:MI:SS')")
+        else:
+            columns.append(name)
+    return f"COPY (SELECT {','.join(columns)} FROM {d.view}) TO STDOUT WITH (FORMAT TEXT, DELIMITER '|', NULL '', ENCODING 'UTF8')"
+
+
 def prepare_snapshot(conn: Connection[Any]) -> None:
     columns = conn.execute(
         "SELECT table_name,column_name FROM information_schema.columns "
@@ -46,28 +109,14 @@ def prepare_snapshot(conn: Connection[Any]) -> None:
     for table, column in columns:
         actual.setdefault(table, []).append(column)
     for d in DATASETS:
-        if actual.get("mt_" + d.name) != list(d.columns):
+        found = actual.get("mt_" + d.name)
+        if found != list(d.columns):
             raise RuntimeError(
-                f"Source contract mismatch for {d.table}; expected columns {d.columns}. "
+                f"Source contract mismatch for {d.table}; expected columns {d.columns}, "
+                f"found {tuple(found or ())}. "
                 "Set MULE_PG_DSN to the database containing the mule_temporal export."
             )
-        expressions = []
-        for name, kind in d.fields:
-            pg_type = {
-                "UINT": "numeric(20,0)",
-                "INT": "integer",
-                "DOUBLE": "double precision",
-                "FLOAT": "real",
-                "BOOL": "boolean",
-                "DATETIME": "timestamp",
-            }.get(kind, "text")
-            expressions.append(f'"{name}"::{pg_type} AS "{name}"')
-        _execute(
-            conn,
-            f'CREATE TEMP VIEW "mt_{d.name}" AS SELECT '
-            + ",".join(expressions)
-            + f" FROM {d.table}",
-        )
+        _execute(conn, view_query(d))
     conn.commit()
     conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
     conn.execute("SET LOCAL TIME ZONE 'UTC'")
@@ -94,22 +143,10 @@ def audit_snapshot(conn: Connection[Any]) -> dict[str, Any]:
         counts[d.name] = int(
             _execute(conn, f"SELECT count(*) FROM {d.table}").fetchone()[0]
         )
-        # TEXT COPY is safe only for single-line, unescaped PSV values.
-        invalid = []
-        for name, kind in d.fields:
-            col = f'"{name}"'
-            invalid.append(f"{col} IS NULL")
-            if kind == "UINT":
-                invalid.append(f"{col} !~ '^[0-9]+$'")
-            elif kind == "BOOL":
-                invalid.append(f"lower({col}) NOT IN ('true','false')")
-            elif kind == "INT":
-                invalid.append(f"{col} !~ '^-?[0-9]+$'")
-            elif kind == "STRING":
-                invalid.append(f"{col} ~ E'[|\\\\\\\\\\r\\n\\t\"]'")
         check(
             d.name + ": source values",
-            f"SELECT count(*) FROM {d.table} WHERE " + " OR ".join(invalid),
+            f"SELECT count(*) FROM {d.table} WHERE "
+            + " OR ".join(invalid_source_values(d)),
         )
         ranges = [
             f'"{name}" < 0 OR "{name}" > 18446744073709551615'
@@ -256,10 +293,22 @@ def audit_snapshot(conn: Connection[Any]) -> dict[str, Any]:
         "account mule flag",
         f"SELECT count(*) FROM {account} WHERE is_mule NOT IN (-1,0,1)",
     )
+    check(
+        "account mule ring",
+        f"SELECT count(*) FROM {account} WHERE mule_ring_id < -1",
+    )
     mule_flags = {
         str(flag): int(count)
         for flag, count in _execute(
             conn, f"SELECT is_mule,count(*) FROM {account} GROUP BY is_mule"
+        ).fetchall()
+    }
+    # Verified after the load: the ring ids must arrive, and MulePatternLearner's
+    # label reveal never writes them.
+    mule_rings = {
+        str(ring): int(count)
+        for ring, count in _execute(
+            conn, f"SELECT mule_ring_id,count(*) FROM {account} GROUP BY mule_ring_id"
         ).fetchall()
     }
     return {
@@ -267,6 +316,7 @@ def audit_snapshot(conn: Connection[Any]) -> dict[str, Any]:
         "counts": counts,
         "checks": checks,
         "account_mule_flags": mule_flags,
+        "account_mule_rings": mule_rings,
     }
 
 
@@ -295,15 +345,7 @@ def export(settings: Settings) -> dict[str, Any]:
             writer = ShardWriter(
                 shards_dir, f"{index:02d}_{d.name.lower()}", settings.shard_bytes
             )
-            columns = []
-            for name, kind in d.fields:
-                if kind == "BOOL":
-                    columns.append(f"CASE WHEN {name} THEN 'true' ELSE 'false' END")
-                elif kind == "DATETIME":
-                    columns.append(f"to_char({name},'YYYY-MM-DD HH24:MI:SS')")
-                else:
-                    columns.append(name)
-            query = f"COPY (SELECT {','.join(columns)} FROM {d.view}) TO STDOUT WITH (FORMAT TEXT, DELIMITER '|', NULL '', ENCODING 'UTF8')"
+            query = copy_query(d)
             try:
                 with conn.cursor().copy(query.encode()) as copy:
                     for chunk in copy:

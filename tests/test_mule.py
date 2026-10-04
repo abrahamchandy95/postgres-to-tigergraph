@@ -2,6 +2,7 @@
 
 import copy
 import json
+import os
 from pathlib import Path
 import re
 from tempfile import TemporaryDirectory
@@ -15,22 +16,120 @@ import requests
 
 from tf_gnn_loader.cli import parser
 from tf_gnn_loader.mule.contract import (
+    BY_NAME,
     DATASETS,
     FORMAT_VERSION,
     GRAPH,
     GSQL,
+    MPL_SCOPE_EDGES,
+    MPL_SCOPE_VERTEX,
+    ROOT,
     VERTICES,
     visible,
 )
 from tf_gnn_loader.mule.gsql import loading_jobs, verify_query
+from tf_gnn_loader.mule.postgres import copy_query, invalid_source_values, view_query
 from tf_gnn_loader.mule.tigergraph import (
     load,
     read_manifest,
     upload_shard,
     validate_schema,
+    verify,
 )
 from tf_gnn_loader.tigergraph.loading import sha256
 from tf_gnn_loader.tigergraph.settings import Settings
+
+
+# MulePatternLearner's Account label contract (its docs/reference/labels.md,
+# "Loading accounts"), in load order, with the types of its schema.gsql.
+ACCOUNT_CONTRACT = (
+    ("id", "STRING"),
+    ("account_type", "STRING"),
+    ("is_external", "BOOL"),
+    ("first_seen_seq", "UINT"),
+    ("first_seen_ts_ms", "UINT"),
+    ("is_mule", "INT"),
+    ("mule_label_known", "BOOL"),
+    ("is_mule_masked", "BOOL"),
+    ("pu_label", "INT"),
+    ("mule_label_effective_seq", "UINT"),
+    ("mule_label_effective_ts_ms", "UINT"),
+    ("mule_label_available_seq", "UINT"),
+    ("mule_label_available_ts_ms", "UINT"),
+    ("mule_ring_id", "INT"),
+    ("mule_label_source", "STRING"),
+)
+ACCOUNT_JOB = (
+    "Account VALUES ($0, $1, $2, $3, $4, $6, $7, $8, $9, $10, $11, $12, $13, $14, $5)"
+)
+# The sibling MulePatternLearner checkout, read only, for the identity tests.
+MPL = Path(os.getenv("MULE_PATTERN_LEARNER_DIR") or ROOT.parent / "MulePatternLearner")
+
+
+def mpl_text(relative: str) -> str:
+    path = MPL / relative
+    if not path.is_file():
+        raise unittest.SkipTest(
+            f"No MulePatternLearner checkout at {MPL}; set MULE_PATTERN_LEARNER_DIR"
+        )
+    return path.read_text()
+
+
+def ddl_schema(ddl: str) -> dict[str, Any]:
+    """The getSchema answer of a graph created by running fresh-graph DDL."""
+    source = re.sub(r"/\*.*?\*/", "", ddl, flags=re.S)
+    graph = re.search(r"CREATE GRAPH (\w+)", source)
+    assert graph is not None
+    schema: dict[str, Any] = {
+        "GraphName": graph.group(1),
+        "VertexTypes": [],
+        "EdgeTypes": [],
+    }
+    for kind, name, body, options in re.findall(
+        r"ADD (VERTEX|DIRECTED EDGE) (\w+)\s*\((.*?)\) WITH ([^;]*);", source, re.S
+    ):
+        item: dict[str, Any] = {"Name": name, "Attributes": []}
+        for part in (p.strip() for p in body.split(",")):
+            if endpoint := re.fullmatch(r"(FROM|TO) (\w+)", part):
+                key = (
+                    "FromVertexTypeName"
+                    if endpoint[1] == "FROM"
+                    else "ToVertexTypeName"
+                )
+                item[key] = endpoint[2]
+                continue
+            declared = re.fullmatch(
+                r"(PRIMARY_ID |DISCRIMINATOR\()?(\w+) (LIST<\w+>|\w+)\)?(?: DEFAULT .*)?",
+                part,
+            )
+            assert declared is not None, part
+            prefix, attribute, kind_name = declared.groups()
+            value = re.fullmatch(r"LIST<(\w+)>", kind_name)
+            attribute_type: dict[str, Any] = (
+                {"Name": "LIST", "ValueTypeName": value[1]}
+                if value
+                else {"Name": kind_name}
+            )
+            entry: dict[str, Any] = {
+                "AttributeName": attribute,
+                "AttributeType": attribute_type,
+            }
+            if prefix == "PRIMARY_ID ":
+                item["PrimaryId"] = {
+                    **entry,
+                    "PrimaryIdAsAttribute": 'PRIMARY_ID_AS_ATTRIBUTE="true"' in options,
+                }
+            else:
+                if prefix:
+                    entry["IsDiscriminator"] = True
+                item["Attributes"].append(entry)
+        if kind == "VERTEX":
+            schema["VertexTypes"].append(item)
+        else:
+            reverse = re.search(r'REVERSE_EDGE="(\w+)"', options)
+            item["Config"] = {"REVERSE_EDGE": reverse[1] if reverse else ""}
+            schema["EdgeTypes"].append(item)
+    return schema
 
 
 def schema_fixture() -> dict[str, Any]:
@@ -88,6 +187,8 @@ def manifest_fixture(directory: Path) -> dict[str, Any]:
         "audit": {
             "passed": True,
             "counts": {k: v["rows"] for k, v in datasets.items()},
+            "account_mule_flags": {},
+            "account_mule_rings": {},
         },
     }
     (directory / "export_manifest.json").write_text(json.dumps(manifest))
@@ -139,11 +240,131 @@ class TemporalContracts(unittest.TestCase):
         self.assertEqual((GSQL / "verify_load.gsql").read_text(), verify_query())
 
     def test_source_mule_flag_maps_to_final_graph_attribute(self):
+        self.assertIn(ACCOUNT_JOB, loading_jobs())
+        self.assertIn("$8, _, _, _, _, _, _, _, _)", loading_jobs())
+
+    def test_account_table_is_the_fifteen_column_label_contract(self):
+        account = BY_NAME["Account"]
+        self.assertEqual(account.fields, ACCOUNT_CONTRACT)
+        self.assertEqual(account.nullable, ("mule_label_source",))
+        self.assertEqual(
+            [d.name for d in DATASETS if d.nullable and d.name != "Account"], []
+        )
+        self.assertGreaterEqual(FORMAT_VERSION, 5)
+
+    def test_account_storage_order_stores_is_mule_last(self):
+        stored = BY_NAME["Account"].graph_fields
+        self.assertEqual(
+            stored, ACCOUNT_CONTRACT[:5] + ACCOUNT_CONTRACT[6:] + ACCOUNT_CONTRACT[5:6]
+        )
+        self.assertEqual(sorted(stored), sorted(ACCOUNT_CONTRACT))
+
+    def test_account_job_loads_every_column_and_no_default(self):
+        job = re.search(
+            r"CREATE LOADING JOB mt_load_account .*?VALUES \((.*?)\)",
+            loading_jobs(),
+            re.S,
+        )
+        assert job is not None
+        values = [v.strip() for v in job.group(1).split(",")]
+        self.assertNotIn("_", values)
+        self.assertEqual(sorted(int(v.lstrip("$")) for v in values), list(range(15)))
+        self.assertIn(ACCOUNT_JOB, job.group(0))
+
+    def test_every_loaded_attribute_reads_its_own_column(self):
+        for d in DATASETS:
+            job = re.search(
+                rf"TO (?:VERTEX|EDGE) {d.name} VALUES \((.*?)\)", loading_jobs()
+            )
+            assert job is not None
+            values = [v.strip() for v in job.group(1).split(",")]
+            self.assertEqual(len(values), len(d.graph_fields))
+            for (name, _), value in zip(d.graph_fields, values):
+                if value == "_":
+                    self.assertNotIn(name, d.columns)
+                else:
+                    self.assertEqual(d.columns[int(value.lstrip("$"))], name)
+
+    def test_account_job_maps_like_mpl_load_accounts(self):
+        mpl = mpl_text("gsql/schema/account_loading.gsql")
+        header = re.search(r"DEFINE HEADER \w+ = (.*?);", mpl, re.S)
+        values = re.search(r"TO VERTEX Account VALUES \((.*?)\)", mpl, re.S)
+        assert header is not None and values is not None
+        names = re.findall(r'"(\w+)"', header.group(1))
+        self.assertEqual(tuple(names), BY_NAME["Account"].columns)
+        positions = [names.index(n) for n in re.findall(r'\$"(\w+)"', values.group(1))]
         self.assertIn(
-            "Account VALUES ($0, $1, $2, $3, $4, _, _, _, _, _, _, _, _, _, $5)",
+            "Account VALUES (" + ", ".join(f"${i}" for i in positions) + ")",
             loading_jobs(),
         )
-        self.assertIn("$8, _, _, _, _, _, _, _, _)", loading_jobs())
+
+    def test_schema_is_mpl_fresh_graph_ddl(self):
+        self.assertEqual(
+            (GSQL / "schema.gsql").read_text(), mpl_text("gsql/schema/schema.gsql")
+        )
+
+    def test_graph_from_the_ddl_passes_the_push_schema_check(self):
+        schema = ddl_schema((GSQL / "schema.gsql").read_text())
+        validate_schema(schema)
+        self.assertEqual(
+            [len(schema["VertexTypes"]), len(schema["EdgeTypes"])], [8, 19]
+        )
+
+    def test_schema_check_permits_the_mpl_scope_and_nothing_else(self):
+        schema = schema_fixture()
+        scope = copy.deepcopy(schema)
+        scope["VertexTypes"].append({"Name": MPL_SCOPE_VERTEX, "Attributes": []})
+        scope["EdgeTypes"] += [{"Name": name} for name in MPL_SCOPE_EDGES]
+        validate_schema(scope)
+        bad = copy.deepcopy(schema)
+        bad["VertexTypes"].append({"Name": "Other", "Attributes": []})
+        with self.assertRaisesRegex(RuntimeError, "vertex types"):
+            validate_schema(bad)
+        bad = copy.deepcopy(schema)
+        bad["EdgeTypes"].append({"Name": "Other_Edge"})
+        with self.assertRaisesRegex(RuntimeError, "edge types"):
+            validate_schema(bad)
+
+    def test_mpl_scope_names_match_its_scope_ddl(self):
+        scope = re.sub(
+            r"/\*.*?\*/", "", mpl_text("gsql/schema/scope_vertex.gsql"), flags=re.S
+        )
+        self.assertEqual(re.findall(r"ADD VERTEX (\w+)", scope), [MPL_SCOPE_VERTEX])
+        self.assertEqual(
+            tuple(
+                re.findall(r"ADD DIRECTED EDGE (\w+)", scope)
+                + re.findall(r'REVERSE_EDGE="(\w+)"', scope)
+            ),
+            MPL_SCOPE_EDGES,
+        )
+
+    def test_every_flag_loads_like_is_external(self):
+        # PhantomLedger renders True and False; every BOOL takes one path.
+        for d in DATASETS:
+            for name, kind in d.fields:
+                if kind != "BOOL":
+                    continue
+                self.assertIn(
+                    f"lower(\"{name}\") NOT IN ('true','false')",
+                    invalid_source_values(d),
+                )
+                self.assertIn(f'"{name}"::boolean AS "{name}"', view_query(d))
+                self.assertIn(
+                    f"CASE WHEN {name} THEN 'true' ELSE 'false' END", copy_query(d)
+                )
+        flags = [n for n, k in BY_NAME["Account"].fields if k == "BOOL"]
+        self.assertEqual(flags, ["is_external", "mule_label_known", "is_mule_masked"])
+
+    def test_only_the_label_source_may_be_null_and_loads_empty(self):
+        account = BY_NAME["Account"]
+        checks = invalid_source_values(account)
+        for name in account.columns:
+            self.assertEqual(f'"{name}" IS NULL' in checks, name != "mule_label_source")
+        self.assertIn(
+            'coalesce("mule_label_source", \'\')::text AS "mule_label_source"',
+            view_query(account),
+        )
+        self.assertIn("NULL ''", copy_query(account))
 
     def test_schema_rejects_lost_discriminator_and_reordered_attributes(self):
         schema = schema_fixture()
@@ -205,6 +426,47 @@ class TemporalUploads(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "populated graph"):
                 load(self.settings, self.directory)
         self.assertFalse((self.directory / "tigergraph_load_state.json").exists())
+
+    def test_fresh_load_refuses_a_graph_that_keeps_mpl_scope_vertices(self):
+        self.counts[MPL_SCOPE_VERTEX] = 2
+        with patch(
+            "tf_gnn_loader.mule.tigergraph.checked_client", return_value=self.client
+        ):
+            with self.assertRaisesRegex(RuntimeError, MPL_SCOPE_VERTEX + "=2"):
+                load(self.settings, self.directory)
+
+    def test_export_of_another_format_version_is_refused(self):
+        self.manifest["format_version"] = 4
+        (self.directory / "export_manifest.json").write_text(json.dumps(self.manifest))
+        with self.assertRaisesRegex(RuntimeError, "format version 4.*new, empty"):
+            read_manifest(self.directory)
+
+    def test_verify_requires_every_ring_id_to_arrive(self):
+        rings = {"-1": 5, "0": 2, "3": 1}
+        self.manifest["audit"].update(
+            account_mule_flags={"0": 5, "1": 3}, account_mule_rings=rings
+        )
+        (self.directory / "export_manifest.json").write_text(json.dumps(self.manifest))
+        result: dict[str, Any] = {
+            "counts": {"Payment_Transaction": 1},
+            "account_mule_flags": {"0": 5, "1": 3},
+            "account_mule_rings": dict(rings),
+            "violations": 0,
+        }
+        self.client.run_installed_with_timeout = Mock(return_value=[result])
+        with patch(
+            "tf_gnn_loader.mule.tigergraph.checked_client", return_value=self.client
+        ):
+            self.assertEqual(
+                verify(self.settings, self.directory)["account_mule_rings"], rings
+            )
+            # The six-column job left every ring at its default.
+            result["account_mule_rings"] = {"-1": 8}
+            with self.assertRaisesRegex(RuntimeError, "account_mule_rings"):
+                verify(self.settings, self.directory)
+            del result["account_mule_rings"]
+            with self.assertRaisesRegex(RuntimeError, "incomplete"):
+                verify(self.settings, self.directory)
 
     def test_completed_shards_are_resumed_without_upload(self):
         with (

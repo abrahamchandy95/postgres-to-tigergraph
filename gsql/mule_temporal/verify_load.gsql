@@ -4,10 +4,11 @@ USE GRAPH Mule_Pattern_Learner
 CREATE OR REPLACE QUERY mt_validate_graph() FOR GRAPH Mule_Pattern_Learner SYNTAX v2 {
   MapAccum<STRING, SumAccum<INT>> @@counts;
   MapAccum<INT, SumAccum<INT>> @@account_mule_flags;
+  MapAccum<INT, SumAccum<INT>> @@account_mule_rings;
   SumAccum<INT> @@violations;
 
   scan_Party = SELECT v FROM Party:v ACCUM @@counts += ("Party" -> 1), IF v.first_seen_seq == 0 OR v.first_seen_ts_ms == 0 THEN @@violations += 1 END;
-  scan_Account = SELECT v FROM Account:v ACCUM @@counts += ("Account" -> 1), @@account_mule_flags += (v.is_mule -> 1), IF v.first_seen_seq == 0 OR v.first_seen_ts_ms == 0 OR v.is_mule < -1 OR v.is_mule > 1 THEN @@violations += 1 END;
+  scan_Account = SELECT v FROM Account:v ACCUM @@counts += ("Account" -> 1), @@account_mule_flags += (v.is_mule -> 1), @@account_mule_rings += (v.mule_ring_id -> 1), IF v.first_seen_seq == 0 OR v.first_seen_ts_ms == 0 OR v.is_mule < -1 OR v.is_mule > 1 OR v.mule_ring_id < -1 THEN @@violations += 1 END;
   scan_Token = SELECT v FROM Token:v ACCUM @@counts += ("Token" -> 1), IF v.first_seen_seq == 0 OR v.first_seen_ts_ms == 0 THEN @@violations += 1 END;
   scan_Device = SELECT v FROM Device:v ACCUM @@counts += ("Device" -> 1), IF v.first_seen_seq == 0 OR v.first_seen_ts_ms == 0 THEN @@violations += 1 END;
   scan_IP = SELECT v FROM IP:v ACCUM @@counts += ("IP" -> 1), IF v.first_seen_seq == 0 OR v.first_seen_ts_ms == 0 THEN @@violations += 1 END;
@@ -52,6 +53,6 @@ CREATE OR REPLACE QUERY mt_validate_graph() FOR GRAPH Mule_Pattern_Learner SYNTA
   scan_Device_Used_By_Transaction = SELECT t FROM Device:t -(Device_Used_By_Transaction>:e)- Payment_Transaction:s ACCUM @@counts += ("Device_Used_By_Transaction" -> 1), IF e.event_seq != s.event_seq OR e.event_ts_ms != s.event_ts_ms OR t.first_seen_seq > e.event_seq OR t.first_seen_ts_ms > e.event_ts_ms THEN @@violations += 1 END;
   scan_Transaction_Used_IP = SELECT s FROM Payment_Transaction:s -(Transaction_Used_IP>:e)- IP:t ACCUM @@counts += ("Transaction_Used_IP" -> 1), IF e.event_seq != s.event_seq OR e.event_ts_ms != s.event_ts_ms OR t.first_seen_seq > e.event_seq OR t.first_seen_ts_ms > e.event_ts_ms THEN @@violations += 1 END;
   scan_IP_Observed_In_Transaction = SELECT t FROM IP:t -(IP_Observed_In_Transaction>:e)- Payment_Transaction:s ACCUM @@counts += ("IP_Observed_In_Transaction" -> 1), IF e.event_seq != s.event_seq OR e.event_ts_ms != s.event_ts_ms OR t.first_seen_seq > e.event_seq OR t.first_seen_ts_ms > e.event_ts_ms THEN @@violations += 1 END;
-  PRINT @@counts AS counts, @@account_mule_flags AS account_mule_flags, @@violations AS violations;
+  PRINT @@counts AS counts, @@account_mule_flags AS account_mule_flags, @@account_mule_rings AS account_mule_rings, @@violations AS violations;
 }
 INSTALL QUERY mt_validate_graph

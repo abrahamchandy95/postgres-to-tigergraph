@@ -1,7 +1,7 @@
 /*
-Temporal mule detection and Zelle transfer schema. Target: TigerGraph 4.2.5.
-Fresh-graph DDL only. Existing-graph changes live in migrations/; the original
-temporal_valid_time migration requires an empty graph and must not be rerun.
+Mule detection and Zelle transfer schema. Target: TigerGraph 4.2.5.
+Fresh-graph DDL only; never run it on a populated graph. The one-off migrations
+that brought the populated graph to this schema are kept in git history.
 
 One Zelle_Transfer vertex represents one individual Zelle payment. Other rails
 use Payment_Transaction; never duplicate a Zelle transfer in both event types.
@@ -24,15 +24,14 @@ validity intervals. Historical event context uses event_seq < seed_seq.
 
 Known-time fields are deferred until source feeds are confirmed. Valid time
 alone cannot exclude a backdated correction learned after a historical seed.
-This file contains graph DDL only. loading_jobs.gsql maps the six-column
-PostgreSQL Account feed to this storage order; absent supervision fields
-and payment caches retain their defaults. Source is_mule is supervision only.
+This file contains graph DDL only. account_loading.gsql defines the
+fifteen-column Account upload contract, including supervision.
 */
 
 CREATE GRAPH Mule_Pattern_Learner ()
 USE GRAPH Mule_Pattern_Learner
 
-CREATE SCHEMA_CHANGE JOB create_temporal_payment_schema
+CREATE SCHEMA_CHANGE JOB create_payment_schema
 FOR GRAPH Mule_Pattern_Learner {
 
   ADD VERTEX Party (
@@ -264,5 +263,5 @@ FOR GRAPH Mule_Pattern_Learner {
   ) WITH REVERSE_EDGE="IP_Observed_In_Transaction";
 }
 
-RUN SCHEMA_CHANGE JOB create_temporal_payment_schema
-DROP JOB create_temporal_payment_schema
+RUN SCHEMA_CHANGE JOB create_payment_schema
+DROP JOB create_payment_schema

@@ -23,7 +23,15 @@ from tf_gnn_loader.tigergraph.loading import (
     write_json_atomic,
 )
 from tf_gnn_loader.tigergraph.settings import Settings
-from .contract import DATASETS, FORMAT_VERSION, GRAPH, GSQL, VERTICES
+from .contract import (
+    DATASETS,
+    FORMAT_VERSION,
+    GRAPH,
+    GSQL,
+    MPL_SCOPE_EDGES,
+    MPL_SCOPE_VERTEX,
+    VERTICES,
+)
 from .gsql import QUERY, loading_jobs, verify_query
 from .settings import MuleSettings
 
@@ -49,12 +57,18 @@ def validate_schema(schema: dict[str, Any]) -> None:
         raise RuntimeError(f"The target schema must belong to {GRAPH}")
     vertices = {v["Name"]: v for v in schema["VertexTypes"]}
     edges = {e["Name"]: e for e in schema["EdgeTypes"]}
-    if set(vertices) != {d.name for d in VERTICES}:
+    # The schema is MulePatternLearner's fresh-graph DDL, plus the experiment
+    # scope its `mule install` may have added. Nothing else is permitted.
+    if set(vertices) - {MPL_SCOPE_VERTEX} != {d.name for d in VERTICES}:
         raise RuntimeError(
             "Temporal vertex types do not match the requested schema; no automatic migration is permitted"
         )
     required_edges = {d.name for d in DATASETS if not d.vertex}
-    permitted_edges = required_edges | {d.reverse for d in DATASETS if not d.vertex}
+    permitted_edges = (
+        required_edges
+        | {d.reverse for d in DATASETS if not d.vertex}
+        | set(MPL_SCOPE_EDGES)
+    )
     if not required_edges <= set(edges) or set(edges) - permitted_edges:
         raise RuntimeError("Temporal edge types do not match the requested schema")
     for d in DATASETS:
@@ -146,6 +160,15 @@ def install(settings: Settings) -> dict[str, Any]:
 
 def read_manifest(directory: Path, *, check_files: bool = True) -> dict[str, Any]:
     manifest: dict[str, Any] = read_json(directory / "export_manifest.json")
+    if (
+        manifest.get("graphname") == GRAPH
+        and manifest.get("format_version") != FORMAT_VERSION
+    ):
+        raise RuntimeError(
+            f"The temporal export in {directory} has format version "
+            f"{manifest.get('format_version')}; this loader reads {FORMAT_VERSION}. "
+            "Point MULE_EXPORT_DIR at a new, empty directory to export again."
+        )
     if (
         manifest.get("format_version"),
         manifest.get("graphname"),
@@ -283,8 +306,10 @@ def load(settings: Settings, directory: Path) -> dict[str, Any]:
         if not isinstance(counts, dict):
             raise RuntimeError("TigerGraph returned invalid vertex counts")
         if not state_path.exists() and any(counts.values()):
+            populated = ", ".join(f"{k}={v:,}" for k, v in counts.items() if v)
             raise RuntimeError(
-                "Refusing a fresh load into a populated graph; entity metadata is immutable"
+                f"Refusing a fresh load into a populated graph ({populated}); "
+                "entity metadata is immutable"
             )
         jobs = _show_jobs(client)
         if any(not re.search(rf"\b{d.job}\b", jobs) for d in DATASETS):
@@ -371,7 +396,15 @@ def verify(settings: Settings, directory: Path) -> dict[str, Any]:
     for part in raw:
         if isinstance(part, dict):
             merged.update(part)
-    if not {"counts", "violations", "account_mule_flags"} <= merged.keys():
+    if (
+        not {
+            "counts",
+            "violations",
+            "account_mule_flags",
+            "account_mule_rings",
+        }
+        <= merged.keys()
+    ):
         raise RuntimeError("Temporal verification query returned an incomplete result")
     expected = {d.name: manifest["datasets"][d.name]["rows"] for d in DATASETS}
     expected.update({d.reverse: expected[d.name] for d in DATASETS if not d.vertex})
@@ -380,12 +413,12 @@ def verify(settings: Settings, directory: Path) -> dict[str, Any]:
         for k, n in expected.items()
         if merged["counts"].get(k, 0) != n
     }
-    expected_flags = manifest["audit"]["account_mule_flags"]
-    if merged["account_mule_flags"] != expected_flags:
-        mismatches["account_mule_flags"] = {
-            "expected": expected_flags,
-            "actual": merged["account_mule_flags"],
-        }
+    for key in ("account_mule_flags", "account_mule_rings"):
+        if merged[key] != manifest["audit"][key]:
+            mismatches[key] = {
+                "expected": manifest["audit"][key],
+                "actual": merged[key],
+            }
     report: dict[str, Any] = {
         "passed": not mismatches and merged["violations"] == 0,
         "graphname": GRAPH,
@@ -393,6 +426,7 @@ def verify(settings: Settings, directory: Path) -> dict[str, Any]:
         "manifest_sha256": sha256(directory / "export_manifest.json"),
         "counts": merged["counts"],
         "account_mule_flags": merged["account_mule_flags"],
+        "account_mule_rings": merged["account_mule_rings"],
         "violations": merged["violations"],
         "mismatches": mismatches,
     }

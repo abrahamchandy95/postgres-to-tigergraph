@@ -5,9 +5,17 @@ from pathlib import Path
 
 GRAPH = "Mule_Pattern_Learner"
 SOURCE_SCHEMA = "mule_temporal"
-FORMAT_VERSION = 4
+# 5: the Account table carries MulePatternLearner's fifteen-column label
+# contract. An export written under the six-column contract is refused.
+FORMAT_VERSION = 5
 ROOT = Path(__file__).resolve().parents[3]
 GSQL = ROOT / "gsql" / "mule_temporal"
+
+# MulePatternLearner's `mule install` adds its experiment scope
+# (its gsql/schema/scope_vertex.gsql) to a loaded graph. The loader neither
+# loads nor checks these types, but a graph that has them stays loadable.
+MPL_SCOPE_VERTEX = "Temporal_Training_Scope"
+MPL_SCOPE_EDGES = ("Entity_In_Training_Scope", "Training_Scope_Has_Entity")
 
 
 @dataclass(frozen=True)
@@ -17,6 +25,9 @@ class Dataset:
     source: str = ""
     target: str = ""
     reverse: str = ""
+    # STRING columns whose NULL is the empty string (PostgreSQL's CSV COPY
+    # stores an unquoted empty field as NULL). Every other NULL is refused.
+    nullable: tuple[str, ...] = ()
 
     @property
     def association(self) -> bool:
@@ -34,11 +45,11 @@ class Dataset:
     def graph_fields(self) -> tuple[tuple[str, str], ...]:
         """Storage order includes graph attributes absent from the source feed."""
         if self.name == "Account":
-            return self.fields[:-1] + fields(
-                "mule_label_known:BOOL is_mule_masked:BOOL pu_label:INT "
-                "mule_label_effective_seq:UINT mule_label_effective_ts_ms:UINT "
-                "mule_label_available_seq:UINT mule_label_available_ts_ms:UINT "
-                "mule_ring_id:INT mule_label_source:STRING is_mule:INT"
+            # The table keeps is_mule sixth, in MulePatternLearner's load
+            # order; the graph stores it last, because TigerGraph appends a
+            # replaced attribute to storage.
+            return tuple(f for f in self.fields if f[0] != "is_mule") + tuple(
+                f for f in self.fields if f[0] == "is_mule"
             )
         if self.name in ("Payment_Transaction", "Zelle_Transfer"):
             return self.fields + fields(
@@ -70,11 +81,18 @@ VERTICES = (
         "Party",
         fields("id:STRING party_type:STRING first_seen_seq:UINT first_seen_ts_ms:UINT"),
     ),
+    # MulePatternLearner's Account label contract, in its load order
+    # (load_accounts, ACCOUNT_LOAD_COLUMNS). Every label column is supervision.
     Dataset(
         "Account",
         fields(
-            "id:STRING account_type:STRING is_external:BOOL first_seen_seq:UINT first_seen_ts_ms:UINT is_mule:INT"
+            "id:STRING account_type:STRING is_external:BOOL first_seen_seq:UINT first_seen_ts_ms:UINT "
+            "is_mule:INT mule_label_known:BOOL is_mule_masked:BOOL pu_label:INT "
+            "mule_label_effective_seq:UINT mule_label_effective_ts_ms:UINT "
+            "mule_label_available_seq:UINT mule_label_available_ts_ms:UINT "
+            "mule_ring_id:INT mule_label_source:STRING"
         ),
+        nullable=("mule_label_source",),
     ),
     Dataset(
         "Token",

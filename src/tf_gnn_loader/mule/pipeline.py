@@ -14,7 +14,7 @@ def run(command: str) -> dict[str, Any]:
         return {
             "schema_path": str(GSQL / "schema.gsql"),
             "graphname": GRAPH,
-            "instruction": "Fresh graph only. Existing graphs must match the temporal contract; no schema is automatically replaced.",
+            "instruction": "Fresh graph only: MulePatternLearner's fresh-graph DDL, copied byte for byte. An existing graph must already match it; no schema is automatically replaced.",
         }
     pg = postgres_settings()
     if command == "inspect":

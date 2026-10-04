@@ -12,7 +12,7 @@ import unittest
 import psycopg
 
 from tf_gnn_loader.mule.contract import DATASETS
-from tf_gnn_loader.mule.postgres import audit_snapshot
+from tf_gnn_loader.mule.postgres import audit_snapshot, view_query
 
 
 class FixtureConnection:
@@ -55,8 +55,18 @@ class TemporalSourceAudits(unittest.TestCase):
                 attrs.update(
                     first_seen_seq="1",
                     first_seen_ts_ms="1000",
-                    is_external="false",
+                    # PhantomLedger renders booleans as True and False.
+                    is_external="False",
                     is_mule="0",
+                    mule_label_known="False",
+                    is_mule_masked="True",
+                    pu_label="0",
+                    mule_label_effective_seq="1",
+                    mule_label_effective_ts_ms="1000",
+                    mule_label_available_seq="1",
+                    mule_label_available_ts_ms="1000",
+                    mule_ring_id="-1",
+                    mule_label_source="phantomledger_role",
                 )
                 if d.name in ("Payment_Transaction", "Zelle_Transfer"):
                     zelle = d.name == "Zelle_Transfer"
@@ -99,30 +109,13 @@ class TemporalSourceAudits(unittest.TestCase):
                 ).encode(),
                 values,
             )
-            expressions = []
-            for name, kind in d.fields:
-                pg_type = {
-                    "UINT": "numeric(20,0)",
-                    "INT": "integer",
-                    "DOUBLE": "double precision",
-                    "FLOAT": "real",
-                    "BOOL": "boolean",
-                    "DATETIME": "timestamp",
-                }.get(kind, "text")
-                expressions.append(f'"{name}"::{pg_type} AS "{name}"')
-            self.conn.execute(
-                (
-                    f'CREATE TEMP VIEW "mt_{d.name}" AS SELECT '
-                    + ",".join(expressions)
-                    + f' FROM "raw_{d.name}"'
-                ).encode()
-            )
+            self.conn.execute(view_query(d, f'"raw_{d.name}"').encode())
 
     def audit(self) -> dict[str, Any]:
         with redirect_stdout(io.StringIO()):
             return audit_snapshot(self.fixture)
 
-    def change(self, table: str, column: str, value: str) -> None:
+    def change(self, table: str, column: str, value: str | None) -> None:
         self.conn.execute(f'UPDATE "raw_{table}" SET "{column}"=%s'.encode(), (value,))
 
     def test_valid_fixture_and_disjoint_repeated_tenures(self) -> None:
@@ -145,6 +138,32 @@ class TemporalSourceAudits(unittest.TestCase):
         self.assertEqual(self.audit()["account_mule_flags"], {"1": 1})
         self.change("Account", "is_mule", "2")
         with self.assertRaisesRegex(RuntimeError, "account mule flag"):
+            self.audit()
+
+    def test_account_label_columns(self) -> None:
+        for column, value, valid in (
+            ("mule_ring_id", None, "-1"),
+            ("mule_label_known", "yes", "False"),
+            ("is_mule_masked", None, "True"),
+            ("pu_label", "0.5", "0"),
+            ("mule_label_available_ts_ms", "-1", "1000"),
+            ("mule_label_source", "a|b", "phantomledger_role"),
+        ):
+            with self.subTest(column=column, value=value):
+                self.change("Account", column, value)
+                with self.assertRaisesRegex(RuntimeError, "Account: source values"):
+                    self.audit()
+                self.change("Account", column, valid)
+        self.change("Account", "mule_ring_id", "0")
+        self.change("Account", "is_mule", "1")
+        self.assertEqual(self.audit()["account_mule_rings"], {"0": 1})
+        # An external account's empty source arrives as NULL and loads empty.
+        self.change("Account", "mule_label_source", None)
+        self.assertTrue(self.audit()["passed"])
+        row = self.conn.execute(b'SELECT mule_label_source FROM "mt_Account"')
+        self.assertEqual(row.fetchone(), ("",))
+        self.change("Account", "mule_ring_id", "-2")
+        with self.assertRaisesRegex(RuntimeError, "account mule ring"):
             self.audit()
 
     def test_zero_clock_and_fractional_sequence_are_rejected(self) -> None:
