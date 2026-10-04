@@ -14,6 +14,15 @@ shards, installs loading jobs, uploads resumably, and verifies forward/reverse
 edge counts and clocks. Its output directory is `MULE_EXPORT_DIR`. It reuses
 `HOST`, `GRAPHNAME`, and `SECRET`. See [.env.example](.env.example).
 
+The graph's schema is MulePatternLearner's fresh-graph DDL, copied byte for
+byte into [gsql/mule_temporal/schema.gsql](gsql/mule_temporal/schema.gsql).
+`mt_Account` carries MulePatternLearner's fifteen-column Account label
+contract, and the push loads every column, mule ring ids included
+([The Account table](docs/mule_temporal.md#the-account-table)). To replace a
+loaded corpus with a regenerated one (clear the graph, push, then
+MulePatternLearner's `mule install` and `mule train`), follow
+[A fresh push](docs/mule_temporal.md#a-fresh-push).
+
 ## Card-fraud use case
 
 Loads the PhantomLedger card-fraud corpus into the `TransactionFraud_GNN`
